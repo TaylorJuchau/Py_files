@@ -1179,7 +1179,7 @@ def get_filter_wl_range(filter):
 
 
 
-def show_images(image_files, loc, radius, ncols=3, cmap='viridis'):
+def show_images(image_files, loc, radius, ncols=3, cmap='viridis', zoom = 5):
     """
     Create a collage of cutout images with an aperture overlay.
     
@@ -1195,6 +1195,8 @@ def show_images(image_files, loc, radius, ncols=3, cmap='viridis'):
         Number of columns in the collage (default = 3).
     cmap : str, optional
         Colormap for displaying images (default = 'viridis').
+    zoom : float, optional
+        How many radii does image include (default = 5)
     """
     
     # Make sure loc is SkyCoord
@@ -1219,7 +1221,7 @@ def show_images(image_files, loc, radius, ncols=3, cmap='viridis'):
         pixel_scale = np.abs(wcs.wcs.cdelt[0]) * 3600  # arcsec/pixel
 
         # Make cutout
-        cutout = Cutout2D(image, position=loc_sky, size=(radius*3, radius*3), wcs=wcs)
+        cutout = Cutout2D(image, position=loc_sky, size=(radius*zoom, radius*zoom), wcs=wcs)
 
         # Convert SkyCoord -> pixel coords
         x_img, y_img = cutout.wcs.world_to_pixel(loc_sky)
