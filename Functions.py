@@ -52,7 +52,7 @@ locations = [[202.5062429, 47.2143358], [202.4335225, 47.1729608], [202.4340450,
 print('Some functions use pre-defined data files, a warning will print when this is the case.')
 try:
     filter_directory = '/project/galaxies/tjuchau/data_files/Filters/JWST_filters/'
-    image_directory = '/project/galaxies/tjuchau/data_files/M51/Images/v0p3p2/'
+    image_directory = '/project/galaxies/tjuchau/data_files/JWST/images/v0p3p2/ngc5194/'
     print(f'Current default filter data directory {filter_directory}')
     print(f'Current default image directory {image_directory}')
 except:
