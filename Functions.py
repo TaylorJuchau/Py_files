@@ -2571,3 +2571,53 @@ def convolve_ifu_cube(
     return output_path
 
 
+def get_EW_using_filters(feature_filter_file, continuum_filter_files, location, radius):
+    #TJ load files
+
+    #TJ get all 3 image fluxes
+    Fnu_feature = get_image_flux(feature_filter_file, location, radius, replace_negatives=False)
+    Fnu_cont = [get_image_flux(f, location, radius, replace_negatives=False) for f in continuum_filter_files]
+    feature_filter = extract_filter_name(feature_filter_file)
+    continuum_filters = [extract_filter_name(x) for x in continuum_filter_files]
+    if Fnu_feature.unit != Fnu_cont[0].unit:
+        print('units are not the same in the feature image and continuum image!')
+    elif Fnu_feature.unit == u.W/(u.m**2*u.Hz):
+            
+        #TJ look up pivot wavelengths
+        pivot_feat = jwst_pivots[feature_filter]
+        pivot_cont = [jwst_pivots[extract_filter_name(f)] for f in continuum_filter_files]
+        
+        #TJ convert continuum levels into F_lambda using pivot wavelengths, still need to multiply by dlamda
+        fλ_cont = [(Fnu * c / pivot**2).to(u.W / u.m**2 / u.m)
+                   for Fnu, pivot in zip(Fnu_cont, pivot_cont)]
+        
+        #TJ get mean wavelengths
+        cont_wls = [jwst_means[f] for f in continuum_filters]
+        line_wl = jwst_means[feature_filter]
+    
+        #TJ interpolate continuum values to the feature wavelength
+        feature_continuum = np.interp(
+            line_wl.value,
+            [w.value for w in cont_wls],
+            [f.value for f in fλ_cont]
+        ) * u.W / u.m**2 / u.m
+        
+        #TJ print continuum if needed
+        #print("F_lamda of photo continuum : ", feature_continuum)
+        #TJ get filter transmission curve info
+        wl, T = get_filter_data(feature_filter)
+    
+        #TJ multiply feature F_lambda by dlambda to complete unit conversion
+        norm = np.trapezoid(T, wl) / np.max(T)
+        cont_in_filter = feature_continuum * norm
+        
+        #TJ convert feature filter's F_nu into F_lamda
+        fλ_feature = ((Fnu_feature * c / pivot_feat**2).to(u.W / u.m**2 / u.m))*norm 
+    
+        #TJ feature area is only the area above the continuum
+        feature_only = fλ_feature - cont_in_filter
+    
+        #TJEquivalent width is this area divided by the continuum level
+        EW = (feature_only / feature_continuum).to(u.m)
+    
+        return EW
