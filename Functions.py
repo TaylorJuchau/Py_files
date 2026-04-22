@@ -1214,12 +1214,17 @@ def show_images(image_files, loc, radius, ncols=3, cmap='viridis', zoom = 5):
     
     for ax, image_file in zip(axes, image_files):
         # Load FITS
-        hdu = fits.open(image_file)['SCI']
+        try:
+            hdu = fits.open(image_file)['SCI']
+        except:
+            hdu = fits.open(image_file)[0]
         image = hdu.data
         header = hdu.header
         wcs = WCS(header, naxis=2)
-        pixel_scale = np.abs(wcs.wcs.cdelt[0]) * 3600  # arcsec/pixel
-
+        try:
+            pixel_scale = np.abs(wcs.wcs.cd[0][0]) *3600
+        except:
+            pixel_scale = np.abs(wcs.wcs.cdelt[0]) * 3600  # arcsec/pixel
         # Make cutout
         cutout = Cutout2D(image, position=loc_sky, size=(radius*zoom, radius*zoom), wcs=wcs)
 
@@ -2621,3 +2626,32 @@ def get_EW_using_filters(feature_filter_file, continuum_filter_files, location, 
         EW = (feature_only / feature_continuum).to(u.m)
     
         return EW
+
+def run_py_on_ARCC(job_directory, job_title, py_file, cpus = 1, memory=32, fail_notification=True, finish_notification=False, time=8, conda = "Modeling"):
+    filename = os.path.join(job_directory, job_title + ".sh")
+
+    with open(filename, 'w') as f:
+        f.write(f'#!/bin/bash\n')
+        f.write('#SBATCH --account=galaxies\n')
+        if fail_notification and finish_notification:
+            f.write('#SBATCH --mail-type=FAIL,END\n')
+        elif fail_notification:
+            f.write('#SBATCH --mail-type=FAIL\n')
+        elif finish_notification:
+            f.write('#SBATCH --mail-type=END\n')
+        f.write(f'''#SBATCH --mail-user=tjuchau@uwyo.edu
+            
+#SBATCH --job-name={job_title}
+#SBATCH --output={job_title}.out
+#SBATCH --error={job_title}.err
+#SBATCH --time={time}:00:00
+#SBATCH --mem={memory}G
+#SBATCH --cpus-per-task={cpus}''')
+
+        f.write(f'''
+source ~/.bashrc
+conda activate {conda}
+cd {job_directory}
+python {py_file}''')
+    os.chdir(job_directory)
+    os.system(f'sbatch {job_title}.sh')
