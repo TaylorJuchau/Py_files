@@ -645,7 +645,7 @@ def find_max_radius(IFU_file, image_file, loc, min_radius=0.1*u.arcsec, max_radi
     return (best_radius if best_radius > 0 else 0.0), best_radius/IFU_pix_scale,  best_radius/image_pix_scale
 
 
-def get_filter_data(filter_name, filter_file_list = filter_files):
+def get_filter_data(filter_name, filter_file_list=filter_files, aux_info=False):
     filter_file = [filter_filepath for filter_filepath in filter_file_list if extract_filter_name(filter_filepath) == filter_name][0]
 
     filter_data = [] #TJ initialize filter data
@@ -661,7 +661,11 @@ def get_filter_data(filter_name, filter_file_list = filter_files):
     header, filter_T = filter_data[:2], np.array(filter_data[2:]) #TJ separate filter header from data
     filter_wl = np.array([try_float(row[0]) * 1e-10 for row in filter_T])*u.m #TJ separate filter wavelengths from transmission
     filter_trans = np.array([try_float(row[1]) for row in filter_T])
-    return filter_wl, filter_trans
+    if not aux_info:
+        return filter_wl, filter_trans
+    else:
+        eff_width = np.trapezoid(filter_trans, filter_wl).to(u.um)/np.max(filter_trans)
+        return filter_wl, filter_trans, eff_width
 
 
 
@@ -826,7 +830,7 @@ def find_point_spectrum(IFU_filepath, loc):
     
     return interpolated_spectrum
 
-def get_Fnu_transmission(Fnu_array, wl_array, transmission_array, trans_wl_array, warnings = True):
+def get_Fnu_transmission(Fnu_array, wl_array, transmission_array, trans_wl_array, warnings = True, counter = 'energy'):
     '''get expected flux through filter. Assumes Fnu array is in W/m2/Hz and wl array is in meters. Otherwise, units will be weird.
     -------------
     
@@ -885,8 +889,10 @@ def get_Fnu_transmission(Fnu_array, wl_array, transmission_array, trans_wl_array
     #TJ this is because jwst transmission arrays are averages over BW widths which are much coarser than Fnu is.
     interp_Fnu = np.interp(trans_freq_array, spec_freq_array, Fnu_array)
     
-    
-    weight = transmission_array / trans_freq_array #TJ weight the numerator and denominator by T *d_nu over nu for integration
+    if counter == 'photons':
+        weight = transmission_array / trans_freq_array #TJ weight the numerator and denominator by T *d_nu over nu for integration
+    elif counter == 'energy':
+        weight = transmission_array    
     numerator = np.trapezoid(interp_Fnu * weight, trans_freq_array)#TJ perform integration
     denominator = np.trapezoid(weight, trans_freq_array)
     ab_mean_flux = numerator / denominator
@@ -2625,7 +2631,7 @@ def get_EW_using_filters(feature_filter_file, continuum_filter_files, location, 
         #TJEquivalent width is this area divided by the continuum level
         EW = (feature_only / feature_continuum).to(u.m)
     
-        return EW
+        return EW, Fnu_feature, Fnu_cont[0], Fnu_cont[1]
 
 def run_py_on_ARCC(job_directory, job_title, py_file, cpus = 1, memory=32, fail_notification=True, finish_notification=False, time=8, conda = "Modeling"):
     filename = os.path.join(job_directory, job_title + ".sh")
@@ -2688,3 +2694,40 @@ cd {job_directory}
 {command}''')
     os.chdir(job_directory)
     os.system(f'sbatch {job_title}.sh')
+
+
+def check_if_job_finished(job_directory, job_title):
+    """
+    Check if a SLURM job has finished by inspecting .out and .err files.
+    
+    Prints status inline and returns True when job is done.
+    """
+    
+    print(f"checking if job {job_title} is done", end='\r')
+    
+    out_file = os.path.join(job_directory, f"{job_title}.out")
+    err_file = os.path.join(job_directory, f"{job_title}.err")
+    
+    # --- Check existence first ---
+    if not (os.path.exists(out_file) and os.path.exists(err_file)):
+        return False
+    
+    # --- Check non-zero size ---
+    size_out_1 = os.path.getsize(out_file)
+    size_err_1 = os.path.getsize(err_file)
+    
+    if size_out_1 == 0 or size_err_1 == 0:
+        return False
+    
+    # --- Wait to ensure writing is finished ---
+    time.sleep(5)
+    
+    size_out_2 = os.path.getsize(out_file)
+    size_err_2 = os.path.getsize(err_file)
+    
+    # --- Ensure files are no longer growing ---
+    if size_out_1 == size_out_2 and size_err_1 == size_err_2:
+        print(f"job {job_title} finished                                         ")
+        return True
+    
+    return False
