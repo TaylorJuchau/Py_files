@@ -2633,6 +2633,117 @@ def get_EW_using_filters(feature_filter_file, continuum_filter_files, location, 
     
         return EW, Fnu_feature, Fnu_cont[0], Fnu_cont[1]
 
+from astropy.constants import c
+import astropy.units as u
+import numpy as np
+
+
+def get_equivalent_width(
+    feature_filter_file,
+    continuum_filter_file,
+    location,
+    radius
+):
+
+    """
+    Compute equivalent width from:
+        - raw feature filter image
+        - scaled continuum image
+
+    Parameters
+    ----------
+    feature_filter_file : str
+        Path to original feature filter image
+        (e.g. F187N or F658N)
+
+    continuum_filter_file : str
+        Path to aligned/scaled continuum estimate image.
+
+    location : either skycoord or [ra, dec]
+
+    radius : float
+        Aperture radius in pixels.
+
+    Returns
+    -------
+    EW : astropy Quantity
+        Equivalent width.
+
+    line_flux : astropy Quantity
+        Integrated emission line flux.
+
+    continuum_flux_density : astropy Quantity
+        Continuum flux density underneath line.
+
+    feature_flux : astropy Quantity
+        Total narrowband flux.
+
+    continuum_flux : astropy Quantity
+        Continuum contribution inside filter.
+    """
+
+    feature_flux = get_image_flux(
+        feature_filter_file,
+        location,
+        radius,
+        replace_negatives=False
+    )
+
+    continuum_flux = get_image_flux(
+        continuum_filter_file,
+        location,
+        radius,
+        replace_negatives=False
+    )
+
+    if feature_flux.unit != continuum_flux.unit:
+
+        raise ValueError(
+            'Feature and continuum images '
+            'have different units.'
+        )
+
+    feature_filter = extract_filter_name(
+        feature_filter_file
+    )
+
+    pivot = jwst_pivots[feature_filter]
+    #TJ convert Fnu -> Flambda
+    flam_feature = (
+        feature_flux * c / pivot**2
+    ).to(u.W / u.m**2 / u.m)
+
+    flam_continuum = (
+        continuum_flux * c / pivot**2
+    ).to(u.W / u.m**2 / u.m)
+    
+    wl, T = get_filter_data(feature_filter)
+
+    #TJ get filter effective width
+    bandwidth = (
+        np.trapezoid(T, wl) / np.max(T)
+    )
+
+    #TJ get integrated flux inside filter
+    feature_in_filter = flam_feature * bandwidth
+
+    continuum_in_filter = (
+        flam_continuum * bandwidth
+    )
+
+    #TJ isolated emission line flux
+    line_flux = (
+        feature_in_filter -
+        continuum_in_filter
+    )
+
+    #TJ extract equivalent width
+    EW = (
+        line_flux / flam_continuum
+    ).to(u.Angstrom)
+
+    return EW
+
 def run_py_on_ARCC(job_directory, job_title, py_file, cpus = 1, memory=32, fail_notification=True, finish_notification=False, time=8, conda = "Modeling"):
     filename = os.path.join(job_directory, job_title + ".sh")
 
