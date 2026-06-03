@@ -3,6 +3,7 @@ from tabulate import tabulate
 from pathlib import Path
 import pickle
 import os
+import json
 import glob
 import re
 import sys
@@ -645,27 +646,260 @@ def find_max_radius(IFU_file, image_file, loc, min_radius=0.1*u.arcsec, max_radi
     return (best_radius if best_radius > 0 else 0.0), best_radius/IFU_pix_scale,  best_radius/image_pix_scale
 
 
-def get_filter_data(filter_name, filter_file_list=filter_files, aux_info=False):
-    filter_file = [filter_filepath for filter_filepath in filter_file_list if extract_filter_name(filter_filepath) == filter_name][0]
+def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tjuchau/data_files/Filters/"):
 
-    filter_data = [] #TJ initialize filter data
-    with open(filter_file, 'r') as f: #TJ extract filter data (still has headers)
-        header = f.readline().strip().split()
-        for line in f:
-            data_line = line.strip().split()
-            filter_data.append(data_line)
-    if len(filter_data) < 2:
-        print(f"Filter file {filter_file} seems empty or malformed.")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    dat_file  = os.path.join(cache_dir, f"{filter_name}.dat")
+    meta_file = os.path.join(cache_dir, f"{filter_name}.meta.json")
+
+    def load_meta():
+        if os.path.exists(meta_file):
+            with open(meta_file, "r") as f:
+                return json.load(f)
         return None
+
+    def save_meta(meta):
+        with open(meta_file, "w") as f:
+            json.dump(meta, f, indent=2)
+    def filter_to_svo(filter_name):
+        """
+        Convert shorthand filter name into
+        SVO Filter Profile Service ID.
     
-    header, filter_T = filter_data[:2], np.array(filter_data[2:]) #TJ separate filter header from data
-    filter_wl = np.array([try_float(row[0]) * 1e-10 for row in filter_T])*u.m #TJ separate filter wavelengths from transmission
-    filter_trans = np.array([try_float(row[1]) for row in filter_T])
+        Parameters
+        ----------
+        filter_name : str
+            Examples:
+                'F150W'
+                'F187N'
+                'F444W'
+    
+        Returns
+        -------
+        svo_id : str
+    
+            Example:
+                'JWST/NIRCam.F150W'
+        """
+    
+        filter_name = filter_name.upper()
+        
+        #TJ define NIRCam filters
+        nircam_filters = {
+    
+            # Wide
+            'F070W', 'F090W', 'F115W',
+            'F150W', 'F200W', 'F277W',
+            'F356W', 'F444W',
+    
+            # Medium
+            'F140M', 'F162M', 'F182M',
+            'F210M', 'F250M', 'F300M',
+            'F335M', 'F360M', 'F410M',
+            'F430M', 'F460M', 'F480M',
+    
+            # Narrow
+            'F164N', 'F187N', 'F212N',
+            'F323N', 'F405N', 'F466N',
+            'F470N'
+        }
+    
+        #TJ define MIRI filters
+        miri_filters = {
+    
+            'F560W', 'F770W', 'F1000W',
+            'F1130W', 'F1280W', 'F1500W',
+            'F1800W', 'F2100W', 'F2550W',
+    
+            'F1065C', 'F1140C', 'F1550C',
+    
+            'F2300C'
+        }
+    
+        #TJ define NIRISS filters
+        niriss_filters = {
+    
+            'F090W', 'F115W', 'F140M',
+            'F150W', 'F158M', 'F200W',
+            'F277W', 'F356W', 'F380M',
+            'F430M', 'F444W', 'F480M'
+        }
+
+        #TJ define HST filters
+        hst_wfc3_uvis = {
+
+        'F218W', 'F225W', 'F275W',
+        'F336W', 'F343N', 'F373N',
+        'F390M', 'F390W',
+
+        'F438W', 'F467M', 'F469N',
+        'F475W', 'F487N', 'F502N',
+
+        'F547M', 'F555W',
+
+        'F606W',
+
+        'F621M', 'F625W',
+        'F631N', 'F645N',
+
+        'F656N', 'F657N',
+        'F658N', 'F665N',
+        'F673N',
+
+        'F680N', 'F689M',
+
+        'F763M', 'F775W',
+
+        'F814W',
+
+        'F845M',
+
+        'F850LP',
+
+        'F953N'
+        }
+
+        hst_wfc3_ir = {
+    
+            'F098M',
+            'F105W',
+            'F110W',
+            'F125W',
+            'F126N',
+            'F127M',
+            'F128N',
+    
+            'F130N',
+            'F132N',
+            'F139M',
+            'F140W',
+    
+            'F153M',
+            'F160W',
+            'F164N',
+            'F167N'
+        }
+
+        hst_acs_wfc = {
+    
+            'F435W',
+            'F475W',
+            'F502N',
+            'F550M',
+            'F555W',
+            'F606W',
+            'F625W',
+            'F658N',
+            'F660N',
+            'F775W',
+            'F814W',
+            'F850LP',
+            'FR656N',
+            'FR716N',
+            'FR782N'
+        }
+    
+        # =====================================================
+        # MATCH LOGIC
+        # =====================================================
+    
+        # JWST
+        if filter_name in nircam_filters:
+    
+            return f'JWST/NIRCam.{filter_name}'
+    
+        elif filter_name in miri_filters:
+    
+            return f'JWST/MIRI.{filter_name}'
+    
+        elif filter_name in niriss_filters:
+    
+            return f'JWST/NIRISS.{filter_name}'
+    
+        # HST
+        elif filter_name in hst_wfc3_ir:
+    
+            return f'HST/WFC3_IR.{filter_name}'
+    
+        elif filter_name in hst_wfc3_uvis:
+    
+            return f'HST/WFC3_UVIS1.{filter_name}'
+    
+        elif filter_name in hst_acs_wfc:
+
+            return f'HST/ACS_WFC.{filter_name}'
+       
+        else:
+    
+            raise ValueError(
+                f'Unknown filter: {filter_name}'
+            )
+    #TJ check if filter data already exists
+    if os.path.exists(dat_file):
+
+        data = np.loadtxt(dat_file)
+        wl = data[:, 0] * u.AA
+        transmission = data[:, 1]
+
+        if not aux_info:
+            return wl.to(u.m), transmission
+
+        meta = load_meta()
+
+        if meta is None:
+            raise RuntimeError("Missing metadata file for cached filter.")
+
+        eff_width = meta["eff_width"] * u.um
+        mean_wl   = meta["mean_wl"] * u.um
+        pivot_wl  = meta["pivot_wl"] * u.um
+
+        return wl.to(u.m), transmission, eff_width, pivot_wl
+
+    #TJ query SVO server for filter data
+    filter_id = filter_to_svo(filter_name)
+
+    url = (
+        "https://svo2.cab.inta-csic.es/"
+        f"theory/fps/fps.php?ID={filter_id}"
+    )
+
+    table = Table.read(url, format='votable')
+
+    wl = np.array(table['Wavelength']) * u.AA
+    transmission = np.array(table['Transmission'])
+
+    wl_um = wl.to(u.um)
+
+
+    eff_width = np.trapezoid(transmission, wl_um) / np.max(transmission)
+
+    mean_wl = (
+        np.trapezoid(transmission * wl_um, wl_um) /
+        np.trapezoid(transmission, wl_um)
+    )
+
+    num = np.trapezoid(transmission * wl, wl)
+    den = np.trapezoid(transmission / wl, wl)
+    pivot_wl = np.sqrt(num / den).to(u.um)
+    print(pivot_wl)
+
+    np.savetxt(dat_file, np.column_stack([
+        wl.to(u.AA).value,
+        transmission
+    ]))
+
+
+    save_meta({
+        "eff_width": float(eff_width.value),
+        "mean_wl": float(mean_wl.value),
+        "pivot_wl": float(pivot_wl.value),
+    })
+
     if not aux_info:
-        return filter_wl, filter_trans
-    else:
-        eff_width = np.trapezoid(filter_trans, filter_wl).to(u.um)/np.max(filter_trans)
-        return filter_wl, filter_trans, eff_width
+        return wl.to(u.m), transmission
+
+    return wl.to(u.m), transmission, eff_width, pivot_wl
 
 
 
