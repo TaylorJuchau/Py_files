@@ -62,13 +62,6 @@ except:
 print("Wavelength-sorted lists of files saved to variables 'filter_files' and 'image_files'")
 print("Regenerate sorted lists using 'image_files, filter_files = generate_list_of_files(filter_directory, image_directory)'")
 
-with open("/project/galaxies/tjuchau/data_files/Filters/JWST_filters/jwst_filter_means.pkl", "rb") as file:
-    jwst_means = pickle.load(file)
-print('JWST filter mean wavelengths stored as dictionary, called using jwst_means["F115W"]')
-
-with open("/project/galaxies/tjuchau/data_files/Filters/JWST_filters/jwst_pivots.pkl", "rb") as file:
-    jwst_pivots = pickle.load(file)
-print('JWST filter pivot wavelengths stored as dictionary, called using jwst_pivots["F115W"]')
 def extract_filter_name(filepath):
     """
     Extracts JWST-style filter names from a file path.
@@ -854,7 +847,7 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
         mean_wl   = meta["mean_wl"] * u.um
         pivot_wl  = meta["pivot_wl"] * u.um
 
-        return wl.to(u.m), transmission, eff_width, pivot_wl
+        return wl.to(u.m), transmission, eff_width, pivot_wl, mean_wl
 
     #TJ query SVO server for filter data
     filter_id = filter_to_svo(filter_name)
@@ -882,7 +875,6 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
     num = np.trapezoid(transmission * wl, wl)
     den = np.trapezoid(transmission / wl, wl)
     pivot_wl = np.sqrt(num / den).to(u.um)
-    print(pivot_wl)
 
     np.savetxt(dat_file, np.column_stack([
         wl.to(u.AA).value,
@@ -1721,6 +1713,7 @@ def is_filter_relevent(filter, ifu_file):
     -------------
     True if filter's mean wavelength is inside the ifu_file, False if it is not.
     '''
+    print('warning!!!!!!! is_filter_relevent function is deprecated and needs to be updated!!!!!!!')
     wls = SpectralCube.read(ifu_file, hdu = 'SCI').spectral_axis.to(u.m)
     short, long = wls[0], wls[-1]
     return (jwst_means[filter] > short) & (jwst_means[filter] < long)
@@ -1936,7 +1929,7 @@ def get_all_fluxes(filter_files, spec_datasets, image_files, location, radius):
         results['photo_flux'].append(photo_flux)
         filter_wl, filter_trans = get_filter_data(filter_name)
         results['filter_name'].append(filter_name)
-        results['mean_wl'].append(jwst_means[filter_name].value)
+        results['mean_wl'].append(get_filter_data(filter_name, aux_info=True)[4].value)
         needed_data = needed_datasets(filter_name, spec_datasets)
         if len(needed_data) == 0:
             print('no spectral data was found for ', filter_name)
@@ -2837,8 +2830,8 @@ def get_EW_using_filters(feature_filter_file, continuum_filter_files, location, 
                    for Fnu, pivot in zip(Fnu_cont, pivot_cont)]
         
         #TJ get mean wavelengths
-        cont_wls = [jwst_means[f] for f in continuum_filters]
-        line_wl = jwst_means[feature_filter]
+        cont_wls = [get_filter_data(f, aux_info=True)[4] for f in continuum_filters]
+        line_wl = get_filter_data(feature_filter, aux_info=True)[4]
     
         #TJ interpolate continuum values to the feature wavelength
         feature_continuum = np.interp(
