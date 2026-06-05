@@ -640,7 +640,12 @@ def find_max_radius(IFU_file, image_file, loc, min_radius=0.1*u.arcsec, max_radi
 
 
 def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tjuchau/data_files/Filters/"):
-
+    '''Check if filter data exists in the cache_directory, if not, queries SVO website for filter transmission.
+    If aux_info=True, returns:
+    wl, transmission, effective_width, pivot_wl, mean_wl
+    Otherwise, just returns:
+    wl, transmission
+    '''
     os.makedirs(cache_dir, exist_ok=True)
 
     dat_file  = os.path.join(cache_dir, f"{filter_name}.dat")
@@ -850,6 +855,7 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
         return wl.to(u.m), transmission, eff_width, pivot_wl, mean_wl
 
     #TJ query SVO server for filter data
+    print('Filter not found in cache, querying SVO website for filte data...')
     filter_id = filter_to_svo(filter_name)
 
     url = (
@@ -887,6 +893,7 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
         "mean_wl": float(mean_wl.value),
         "pivot_wl": float(pivot_wl.value),
     })
+    print(f'Added filter {filter_name} to cached filter data')
 
     if not aux_info:
         return wl.to(u.m), transmission
@@ -1450,9 +1457,11 @@ def show_images(image_files, loc, radius, ncols=3, cmap='viridis', zoom = 5):
             hdu = fits.open(image_file)['SCI']
         except:
             hdu = fits.open(image_file)[0]
+        
         image = hdu.data
         header = hdu.header
         wcs = WCS(header, naxis=2)
+
         try:
             pixel_scale = np.abs(wcs.wcs.cd[0][0]) *3600
         except:
@@ -2971,6 +2980,9 @@ def get_equivalent_width(
 
     return EW
 
+
+    
+
 def run_py_on_ARCC(job_directory, job_title, py_file, cpus = 1, memory=32, fail_notification=True, finish_notification=False, time=8, conda = "Modeling"):
     filename = os.path.join(job_directory, job_title + ".sh")
 
@@ -3069,3 +3081,4 @@ def check_if_job_finished(job_directory, job_title):
         return True
     
     return False
+
