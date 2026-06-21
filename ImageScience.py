@@ -20,6 +20,7 @@ from photutils.centroids import centroid_quadratic
 import time
 from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
 from astropy.wcs.utils import proj_plane_pixel_area
+from astropy.wcs.utils import proj_plane_pixel_scales
 
 from astropy.visualization import ZScaleInterval
 from scipy.optimize import curve_fit
@@ -44,15 +45,24 @@ def convert_to_fnu_sr(data, header, wcs):
 
     bunit = str(header.get('BUNIT', '')).strip().upper()
 
-    # pixel area in steradians
+    #TJ pixel area in steradians
     pixel_area_sr = proj_plane_pixel_area(wcs) * (np.pi/180.)**2
 
     # --------------------------------------------------
-    # ACS/HST calibrated count rate images
+    #TJ ACS/HST calibrated count rate images
     # --------------------------------------------------
     if bunit == 'W M-2 HZ-1 SR-1':
         print('Data was already in desired units.')
         return data, header
+
+    elif bunit == '1E-20 ERG/S/CM2/ARCSEC2':
+        print('Cnverting data in image from 1e-20 ergs/s/cm2/arcsec2 to W/m2/Hz/sr')
+        f_lam = (data*1e20) * u.erg/u.s/u.cm**2/u.arcsec**2
+        if 'Angstroms' in header.comments['PHOTPLAM']:
+            pivot = (header['PHOTPLAM']*1e-10)*u.m #TJ units of angstroms in 
+        else:
+            print('Could not find units for PHOTPLAM in header')
+        f_nu = (f_lam.to(u.W/u.m**2/u.sr)) * pivot**2 / const.c
 
     elif bunit in ['ERG/S/CM2/PIXEL', 'ERG/S/CM2/PIX']:
 
@@ -231,6 +241,9 @@ class ImageScience:
         y_center,
         radius
     ):
+        '''
+        Used to mask out the galaxy center if it is too bright
+        '''
 
         data = self.images[image_name].copy()
 
@@ -291,6 +304,9 @@ class ImageScience:
         other_image,
         out_file=None
     ):
+        '''
+        Reproject other image into pixel grid of the reference image using WCS info
+        '''
 
         if out_file is None:
 
@@ -341,6 +357,11 @@ class ImageScience:
         )
 
     def sum_images(self, name1, name2, out_name=None, out_file=None, scales=[1,1]):
+        '''
+        Sum two images with the same shape.
+        Usually to take a continuum subtracted line image and a continuum image to recreate full image
+        '''
+
         im1 = self.images[name1]
         im2 = self.images[name2]
         try:
@@ -364,6 +385,10 @@ class ImageScience:
         self.wcs[out_name] = self.wcs[name1]
 
     def sub_images(self, name1, name2, out_name=None, out_file=None, scales=[1,1]):
+        '''
+        Subtract imagename2 from imagename1 with the same shape. For continuum subtraction usually.
+        '''
+
         im1 = self.images[name1]
         im2 = self.images[name2]
         try:
@@ -385,6 +410,38 @@ class ImageScience:
         self.headers[out_name] = self.headers[name1]
         self.files[out_name] = out_file
         self.wcs[out_name] = self.wcs[name1]
+
+    def make_ratio(self, name1, name2, out_name=None, out_file=None, scales=[1,1]):
+        '''
+        Make an image that is the ratio of two images.
+        '''
+
+        im1 = self.images[name1]
+        im2 = self.images[name2]
+        try:
+            image = (im1*scales[0])/(im2*scales[1])
+        except ValueError:
+            print('Images were not the same size')
+        if out_file is not None:
+            hdu = fits.PrimaryHDU(
+                data=image,
+                header=self.headers[name1]
+            )
+
+            hdu.writeto(
+                out_file,
+                overwrite=True
+            )
+
+        if out_name is None:
+            out_name = name1 + '_' + name2 + '_ratio'
+        self.images[out_name] = image
+        self.headers[out_name] = self.headers[name1]
+        self.files[out_name] = out_file
+        self.wcs[out_name] = self.wcs[name1]
+
+    def get_pix_scale(self, wcs_name):
+        return self.wcs[wcs_name].wcs.cdelt[0]*3600*u.arcsec
 
     def get_pix_area(self, name):
         """
@@ -619,19 +676,22 @@ class ImageScience:
 
     def continuum_subtract(
         self,
-        f187_name,
-        continuum_name,
+        feature_image,
+        continuum_image,
         scale_factor,
         out_name='cont_subtracted'
     ):
+        """
+        Outdated function for subtracting continuum
+        """
 
         subtracted = (
-            self.images[f187_name] -
-            scale_factor * self.images[continuum_name]
+            self.images[feature_image] -
+            scale_factor * self.images[continuum_image]
         )
 
         self.images[out_name] = subtracted
-        self.headers[out_name] = self.headers[f187_name].copy()
+        self.headers[out_name] = self.headers[feature_image].copy()
 
         print(f'Created: {out_name}')
 
@@ -641,6 +701,9 @@ class ImageScience:
         output_file,
         scale=1
     ):
+        '''
+        Simple function to save image to a fits file
+        '''
 
         hdu = fits.PrimaryHDU(
             data=self.images[image_name]*scale,
@@ -666,6 +729,11 @@ class ImageScience:
         mask_radius=None,
         show_all=False
     ):
+        """
+        Displays an image that is the feature image minus some scaler times
+        the continuum image, with an interactable slider for changing that scaler.
+        Used to check if stellar light is fully subtracted
+        """
 
         # -----------------------------------------------------
         # COPY DATA
@@ -1060,19 +1128,13 @@ class ImageScience:
             )
 
         pix_area = self.get_pix_area(image_name)
-        if 'CDELT1' in header:
-            pixel_scale_deg = abs(header['CDELT1'])
-        elif 'CD1_1' in header:
-            pixel_scale_deg = abs(header['CD1_1'])
-        else:
-            print('Pixel size not found in header with key CDELT1 or CD1_1, aperture photometry failed')
-            return
+        try:
+            pixel_scale_deg = proj_plane_pixel_scales(wcs)[0]
+        except:
+            print('Pixel size not found in header, aperture photometry failed')
+            return None
         #TJ convert to pixel units instead of angular
         source_radius_pixels = (radius.to_value(u.deg) / pixel_scale_deg)
-
-        bg_inner_pixels = ((radius + buffer).to_value(u.deg) / pixel_scale_deg)
-
-        bg_outer_pixels = ((radius + buffer + background_annulus_thickness).to_value(u.deg) / pixel_scale_deg)
 
         x, y = wcs.all_world2pix(
             spatial_coords.ra.deg,
@@ -1093,15 +1155,9 @@ class ImageScience:
             'source_flux': np.nan*u.W / (u.m**2 * u.Hz),
             'background_flux': np.nan*u.W / (u.m**2 * u.Hz),
             'net_flux': np.nan*u.W / (u.m**2 * u.Hz),
-            'background_per_pixel': np.nan*u.W / (u.m**2 * u.Hz),
+            'background_surface_brightness': np.nan*u.W / (u.m**2 * u.Hz),
             'source_area_pixels': np.nan*u.W / (u.m**2 * u.Hz),
             'annulus_area_pixels': np.nan*u.W / (u.m**2 * u.Hz)}
-
-        bg_annulus = CircularAnnulus(
-            (x, y),
-            r_in=bg_inner_pixels,
-            r_out=bg_outer_pixels
-        )
 
         source_flux = aperture_photometry(
             image_quantity,
@@ -1112,62 +1168,66 @@ class ImageScience:
             source_aperture.area
         )
 
-        annulus_mask = bg_annulus.to_mask(method='exact')
+        if background_annulus_thickness > 0:
+            bg_inner_pixels = ((radius + buffer).to_value(u.deg) / pixel_scale_deg)
 
-        annulus_data = annulus_mask.multiply(image_quantity.value)
+            bg_outer_pixels = ((radius + buffer + background_annulus_thickness).to_value(u.deg) / pixel_scale_deg)
 
-        annulus_weights = annulus_mask.data
+            bg_annulus = CircularAnnulus(
+                (x, y),
+                r_in=bg_inner_pixels,
+                r_out=bg_outer_pixels
+            )
 
-        # VALID PIXELS
-        # =====================================================
 
-        valid = (
-            np.isfinite(annulus_data) &
-            (annulus_weights > 0)
-        )
 
-        annulus_values = annulus_data[valid]
+            annulus_mask = bg_annulus.to_mask(method='exact')
 
-        annulus_weights = annulus_weights[valid]
+            annulus_data = annulus_mask.multiply(image_quantity.value)
 
-        #TJ calculate median pixel value in annulus
-        # =====================================================
+            annulus_weights = annulus_mask.data
 
-        # Recover intrinsic pixel values by dividing
-        # weighted contributions by overlap fraction
+            # VALID PIXELS
+            # =====================================================
 
-        intrinsic_pixel_values = (
-            annulus_values /
-            annulus_weights
-        )
+            valid = (
+                np.isfinite(annulus_data) &
+                (annulus_weights > 0)
+            )
 
-        #TJ extract median background flux with proper units
-        background_per_pixel = np.nanmedian(
-            intrinsic_pixel_values
-        ) * image_quantity.unit * pix_area
+            annulus_values = annulus_data[valid]
 
-        annulus_area_pixels = np.sum(
-            annulus_weights
-        )
-        
-        #TJ now get background in source aperture by multiplying by source area
-        # =====================================================
+            annulus_weights = annulus_weights[valid]
 
-        background_flux = (
-            background_per_pixel *
-            source_area_pixels
-        )
+            #TJ calculate median pixel value in annulus
+            # =====================================================
 
-        net_flux = (
-            source_flux -
-            background_flux
-        )
+            # Recover intrinsic pixel values by dividing
+            # weighted contributions by overlap fraction
+
+            intrinsic_pixel_values = (
+                annulus_values /
+                annulus_weights
+            )
+
+            background_surface_brightness = (np.nanmedian(intrinsic_pixel_values) * image_quantity.unit)
+
+            background_flux = (background_surface_brightness * pix_area * source_area_pixels)
+
+            annulus_area_pixels = np.sum(annulus_weights)
+
+        else:
+            background_flux = 0
+            background_surface_brightness = 0
+            annulus_area_pixels = 0
+
+        net_flux = (source_flux - background_flux)
         
         return {
             'source_flux': source_flux,
             'background_flux': background_flux,
             'net_flux': net_flux,
-            'background_per_pixel': background_per_pixel,
+            'background_surface_brightness': background_surface_brightness,
             'source_area_pixels': source_area_pixels,
             'annulus_area_pixels': annulus_area_pixels
         }
@@ -1293,8 +1353,89 @@ class ImageScience:
         ).to(u.Angstrom)
 
         return EW, line_flux, flam_continuum, feature_flux, continuum_flux
-    
-    def display(self, names, loc, radius, ncols=3, cmap='viridis', zoom = 5):
+        
+    def make_ew_ratio_image(
+        self,
+        halpha_continuum_name,
+        halpha_line_name,
+        paalpha_continuum_name,
+        paalpha_line_name,
+        output_name='EW_Ha_over_PaA',
+        min_continuum=0,
+        min_line=0
+    ):
+        """
+        Create an image of
+
+            EW(Hα) / EW(Paα)
+
+        from continuum and continuum-subtracted images.
+
+        Parameters
+        ----------
+        halpha_continuum_name : str
+            Name of Hα continuum image.
+
+        halpha_line_name : str
+            Name of continuum-subtracted Hα image.
+
+        paalpha_continuum_name : str
+            Name of Paα continuum image.
+
+        paalpha_line_name : str
+            Name of continuum-subtracted Paα image.
+
+        output_name : str
+            Name used to store the output image.
+
+        min_continuum : float
+            Continuum values <= this are masked.
+
+        min_line : float
+            Line values <= this are masked.
+
+        Returns
+        -------
+        ratio : ndarray
+            EW(Hα)/EW(Paα)
+        """
+
+        ha_cont = self.images[halpha_continuum_name].astype(float)
+        ha_line = self.images[halpha_line_name].astype(float)
+
+        pa_cont = self.images[paalpha_continuum_name].astype(float)
+        pa_line = self.images[paalpha_line_name].astype(float)
+
+        ratio = np.full_like(ha_cont, np.nan, dtype=float)
+
+        valid = (
+            np.isfinite(ha_cont) &
+            np.isfinite(ha_line) &
+            np.isfinite(pa_cont) &
+            np.isfinite(pa_line) &
+            (ha_cont > min_continuum) &
+            (pa_cont > min_continuum) &
+            (ha_line > min_line) &
+            (pa_line > min_line)
+        )
+
+        ratio[valid] = (
+            ha_line[valid] *
+            pa_cont[valid]
+        ) / (
+            pa_line[valid] *
+            ha_cont[valid]
+        )
+
+        self.images[output_name] = ratio
+        self.headers[output_name] = self.headers[halpha_line_name].copy()
+        self.wcs[output_name] = self.wcs[halpha_line_name]
+
+        self.headers[output_name]['BUNIT'] = 'dimensionless'
+
+        return ratio
+
+    def display(self, names, loc, radius, background_annulus_thickness=0*u.arcsec, buffer=0*u.arcsec, ncols=3, cmap='viridis', zoom=5, show_grid=False):
         """
         Create a collage of cutout images with an aperture overlay.
         
@@ -1322,53 +1463,110 @@ class ImageScience:
 
         n_images = len(names)
         nrows = int(np.ceil(n_images / ncols))
-        
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), 
-                                subplot_kw={'projection': None})
-        axes = np.atleast_1d(axes).ravel()  # Flatten in case of 1 row/col
-        
-        for ax, name in zip(axes, names):
-            # Load FITS
 
+        fig = plt.figure(figsize=(5*ncols, 5*nrows))
+
+        for i, name in enumerate(names):
             image = self.images[name]
-            header = self.headers[name]
             wcs = self.wcs[name]
 
-
             try:
-                pixel_scale = np.abs(wcs.wcs.cd[0][0]) *3600
+                pixel_scale = np.abs(wcs.wcs.cd[0][0]) * 3600
             except:
-                pixel_scale = np.abs(wcs.wcs.cdelt[0]) * 3600  # arcsec/pixel
-            # Make cutout
-            cutout = Cutout2D(image, position=loc_sky, size=(radius*zoom, radius*zoom), wcs=wcs)
+                pixel_scale = np.abs(wcs.wcs.cdelt[0]) * 3600
+             
+            cutout = Cutout2D(image, position=loc_sky, size=((radius+buffer+background_annulus_thickness)*zoom, (radius+buffer+background_annulus_thickness)*zoom), wcs=wcs)
 
-            # Convert SkyCoord -> pixel coords
+            # Each subplot gets its own WCS projection
+            ax = fig.add_subplot(nrows, ncols, i+1, projection=cutout.wcs)
+
             x_img, y_img = cutout.wcs.world_to_pixel(loc_sky)
 
-            # Plot
             im = ax.imshow(cutout.data, origin='lower', cmap=cmap,
-                    norm=ImageNormalize(cutout.data, stretch=AsinhStretch(), 
+                    norm=ImageNormalize(cutout.data, stretch=AsinhStretch(),
                                         vmin=0, vmax=np.percentile(cutout.data, 99)))
-            ax.add_patch(Circle((x_img, y_img), 
-                                (radius.to(u.arcsec).value)/pixel_scale, 
+
+            if show_grid:
+                ax.coords.grid(color='white', linestyle='--', linewidth=1, alpha=0.7)
+
+            ax.add_patch(Circle((x_img, y_img),
+                                (radius.to(u.arcsec).value) / pixel_scale,
                                 ec='red', fc='none', lw=2, alpha=0.7))
-            cbar = plt.colorbar(
-                im,
-                ax=ax,
-                fraction=0.046,
-                pad=0.04
-            )
+            # Background annulus
+            if background_annulus_thickness > 0*u.arcsec:
+
+                inner_r = (
+                    radius.to(u.arcsec).value +
+                    buffer.to(u.arcsec).value
+                ) / pixel_scale
+
+                outer_r = (
+                    radius.to(u.arcsec).value +
+                    buffer.to(u.arcsec).value +
+                    background_annulus_thickness.to(u.arcsec).value
+                ) / pixel_scale
+
+                ax.add_patch(
+                    Circle(
+                        (x_img, y_img),
+                        inner_r,
+                        ec='cyan',
+                        fc='none',
+                        lw=2,
+                        ls='--',
+                        alpha=0.8
+                    )
+                )
+
+                ax.add_patch(
+                    Circle(
+                        (x_img, y_img),
+                        outer_r,
+                        ec='cyan',
+                        fc='none',
+                        lw=2,
+                        ls='--',
+                        alpha=0.8
+                    )
+                )
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("Flux (native units)", fontsize=10)
             ax.set_title(name, fontsize=12)
             ax.set_xticks([])
             ax.set_yticks([])
 
-        # Hide empty panels if n_images doesn’t fill full grid
-        for ax in axes[n_images:]:
-            ax.axis('off')
-        
+        for i in range(n_images, nrows*ncols):
+            fig.add_subplot(nrows, ncols, i+1).axis('off')
+
         plt.tight_layout()
         plt.show()
+
+    def save_object(self, filename):
+        """
+        Save entire ImageScience object to disk.
+
+        Parameters
+        ----------
+        filename : str
+            Output filename, e.g. 'science.pkl'
+        """
+
+        with open(filename, "wb") as f:
+            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        print(f"Saved ImageScience object to {filename}")
+
+    @classmethod
+    def load_object(cls, filename):
+        """
+        Load a saved ImageScience object.
+        """
+
+        with open(filename, "rb") as f:
+            obj = pickle.load(f)
+
+        print(f"Loaded ImageScience object from {filename}")
+        return obj
 
     # ============================================================
     # QA / DIAGNOSTIC PLOTTING UTILITIES

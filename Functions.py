@@ -51,16 +51,6 @@ os.chdir('/cluster/medbow/project/galaxies/tjuchau/') #TJ change working directo
 
 locations = [[202.5062429, 47.2143358], [202.4335225, 47.1729608], [202.4340450, 47.1732517], [202.4823742, 47.1958589]]
 print('Some functions use pre-defined data files, a warning will print when this is the case.')
-try:
-    filter_directory = '/project/galaxies/tjuchau/data_files/Filters/JWST_filters/'
-    image_directory = '/project/galaxies/tjuchau/data_files/JWST/images/v0p3p2/ngc5194/'
-    print(f'Current default filter data directory {filter_directory}')
-    print(f'Current default image directory {image_directory}')
-except:
-    print('unable to assign image and/or filter directory. Rerun generate_list_of_files(filter_directory, image_directory) or some functions may fail')
-
-print("Wavelength-sorted lists of files saved to variables 'filter_files' and 'image_files'")
-print("Regenerate sorted lists using 'image_files, filter_files = generate_list_of_files(filter_directory, image_directory)'")
 
 def extract_filter_name(filepath):
     """
@@ -129,8 +119,6 @@ def collect_M51_image_and_filter_files(filter_directory, image_directory):
     sorted_filter_names = np.array(filter_file_array)[sort_indices]
     sorted_image_files = np.array(image_file_array)[sort_indices]
     return sorted_image_files, sorted_filter_names
-
-image_files, filter_files = collect_M51_image_and_filter_files(filter_directory, image_directory)
 
 
 
@@ -222,7 +210,7 @@ def get_continuum_around(wavelength_array, flux_array, feature_index, window_siz
     start = max(0, feature_index - window_size)
     end = min(n, feature_index + window_size + 1)
     
-    # Create continuum window (excluding feature core)
+    #TJ Create continuum window (excluding feature core)
     feature_window = slice(max(0, feature_index-2), min(n, feature_index+3))
     cont_window = np.r_[slice(start, feature_window.start), 
                        slice(feature_window.stop, end)]
@@ -232,21 +220,21 @@ def get_continuum_around(wavelength_array, flux_array, feature_index, window_siz
         units = flux_array.unit
     except:
         units = None
-    # Handle edge cases
-    if len(window_fluxes) < 3:  # Need at least 3 points for meaningful stats
+    #TJ Handle edge cases, we need at least 3 points for meaningful stats
+    if len(window_fluxes) < 3: 
         return np.nan, np.nan
     
-    # Calculate robust continuum bounds
+    #TJ calculate continuum bounds using outlier rejection
     q25, q75 = np.nanpercentile(window_fluxes, [25, 75])
     iqr = q75 - q25
     lower_bound = q25 - iqr_mult * iqr
     upper_bound = q75 + iqr_mult * iqr
     
-    # Filter valid continuum points
+    #TJ filter valid continuum points
     good_flux = window_fluxes[(window_fluxes >= lower_bound) & 
                             (window_fluxes <= upper_bound) & 
                             ~np.isnan(window_fluxes)]
-    
+    #TJ return continuum estimates
     return np.nanmean(good_flux), np.nanstd(good_flux)
 
 def assign_feature_weights(wavelength_array, flux_array, continuum_array, sigma_cont, extra_cont_points=2, feature_weight=10, continuum_weight=1):
@@ -256,24 +244,23 @@ def assign_feature_weights(wavelength_array, flux_array, continuum_array, sigma_
     Points above (continuum + sigma_cont) are assigned feature_weight.
     First and last extra_cont_points are also assigned feature_weight to anchor baseline.
     """
+    #TJ initialize weight array
     weights = np.full_like(flux_array, continuum_weight, dtype=float)
     
-    # Identify feature indices
+    #TJ identify feature indices
     feature_indices = np.where(flux_array > (continuum_array + sigma_cont))[0]
     
-    # Assign higher weights to feature
+    #TJ assign higher weights to feature
     weights[feature_indices] = feature_weight
     
-    # Anchor: assign extra points before and after feature
+    #TJ add extra feature indices
     if len(feature_indices) > 0:
         first = feature_indices[0]
         last = feature_indices[-1]
         
-        # Assign higher weight to N points before the feature starts
         start_anchor = max(0, first - extra_cont_points)
         weights[start_anchor:first] = feature_weight
         
-        # Assign higher weight to N points after the feature ends
         end_anchor = min(len(weights), last + extra_cont_points + 1)
         weights[last+1:end_anchor] = feature_weight
 
@@ -284,7 +271,7 @@ def fit_voigt_to(wavelength_of_feature, tolerance, wavelength_array, flux_array,
     '''Fits voigt profile to feature nearest to given wavelength.
 
 
-    need to add backup trial
+    ***need to add backup trial***
 
     -------------
 
@@ -837,7 +824,7 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
     if os.path.exists(dat_file):
 
         data = np.loadtxt(dat_file)
-        wl = data[:, 0] * u.AA
+        wl = data[:, 0] * u.m
         transmission = data[:, 1]
 
         if not aux_info:
@@ -848,9 +835,9 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
         if meta is None:
             raise RuntimeError("Missing metadata file for cached filter.")
 
-        eff_width = meta["eff_width"] * u.um
-        mean_wl   = meta["mean_wl"] * u.um
-        pivot_wl  = meta["pivot_wl"] * u.um
+        eff_width = meta["eff_width"] * u.m
+        mean_wl   = meta["mean_wl"] * u.m
+        pivot_wl  = meta["pivot_wl"] * u.m
 
         return wl.to(u.m), transmission, eff_width, pivot_wl, mean_wl
 
@@ -865,28 +852,25 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
 
     table = Table.read(url, format='votable')
 
-    wl = np.array(table['Wavelength']) * u.AA
+
+    wl = (np.array(table['Wavelength']) * u.AA).to(u.m)
     transmission = np.array(table['Transmission'])
 
-    wl_um = wl.to(u.um)
-
-
-    eff_width = np.trapezoid(transmission, wl_um) / np.max(transmission)
+    eff_width = np.trapezoid(transmission, wl) / np.max(transmission)
 
     mean_wl = (
-        np.trapezoid(transmission * wl_um, wl_um) /
-        np.trapezoid(transmission, wl_um)
+        np.trapezoid(transmission * wl, wl) /
+        np.trapezoid(transmission, wl)
     )
 
     num = np.trapezoid(transmission * wl, wl)
     den = np.trapezoid(transmission / wl, wl)
-    pivot_wl = np.sqrt(num / den).to(u.um)
+    pivot_wl = np.sqrt(num / den).to(u.m)
 
     np.savetxt(dat_file, np.column_stack([
-        wl.to(u.AA).value,
+        wl.value,
         transmission
     ]))
-
 
     save_meta({
         "eff_width": float(eff_width.value),
@@ -896,10 +880,9 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
     print(f'Added filter {filter_name} to cached filter data')
 
     if not aux_info:
-        return wl.to(u.m), transmission
+        return wl, transmission
 
-    return wl.to(u.m), transmission, eff_width, pivot_wl
-
+    return wl, transmission, eff_width, pivot_wl, mean_wl
 
 
 def get_IFU_spectrum(IFU_filepath, loc, radius, replace_negatives = False):
@@ -1497,7 +1480,7 @@ def show_images(image_files, loc, radius, ncols=3, cmap='viridis', zoom = 5):
     plt.tight_layout()
     plt.show()
 
-def show_image_and_synth(filter, ifu_fileset, loc, radius, image_files=image_files, color_min_max = [1, 99.5]):
+def show_image_and_synth(filter, ifu_fileset, loc, radius, image_files, color_min_max = [1, 99.5]):
     """
     Show real image and synthetic IFU-derived image side by side.
     Works with either one or two IFU cubes needed for the filter.
@@ -2322,8 +2305,6 @@ def plot_results(results, correction='mult', show_images=[], color_min_max=[1, 9
     # TJ find the image files that were asked to be displayed within the figure
     show_image_files = [x for x in results['image_files'] if extract_filter_name(x) in show_images]
     # TJ set the locations of the images to display
-    image_locations = [(0.05, 0.75, 0.2, 0.2), (0.3, 0.75, 0.2, 0.2), (0.6, 0.41, 0.2, 0.2), (0.8, 0.41, 0.2, 0.2),
-                       (0.85, 0.65, 0.18, 0.18)]
 
     # TJ if show images is a list of filters, then put them into the figure
     for i, (img, title) in enumerate(zip(show_image_files, show_images)):
