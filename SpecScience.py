@@ -159,6 +159,7 @@ class SpecScience:
         #TJ initialize dictionary of class attributes
         self.cubes = {} #TJ full 4D datacube
         self.headers = {} #TJ header from the file (may be modified with functions)
+        self.wavelengths = {}
         self.files = {} #TJ paths to files
         self.wcs = {} #TJ WCS information from header files
         self.spectra = {} #TJ dictionary with keys for wavelength, frequency, F_nu, and F_lambda
@@ -198,6 +199,7 @@ class SpecScience:
             cube = cube.to(u.W / (u.m**2 * u.Hz * u.sr))
         elif cube.unit == 'MJy':
             cube = cube.to(u.W / (u.m**2 * u.Hz))
+        self.wavelengths[name] = cube.spectral_axis.to(u.m).copy()
         self.cubes[name] = cube
         self.headers[name] = header
         self.wcs[name] = wcs
@@ -835,7 +837,6 @@ class SpecScience:
         )
         cut_image= cutout.data                        # (ny_cut, nx_cut)
         cut_wcs= cutout.wcs                                  # WCS of the cutout
-        print(cut_image)
         # ------------------------------------------------------------------
         # 3.  Detect & fit centroids in both images
         # ------------------------------------------------------------------
@@ -930,6 +931,7 @@ class SpecScience:
         self.wcs[out_name]     = new_wcs_3d
         self.headers[out_name] = new_header
         self.cubes[out_name] = spectral_cube_obj
+        self.wavelengths[out_name] = self.wavelengths[cube_name]
         if out_file is not None:
             _write_cube_to_fits(aligned_cube, new_header, out_file)
             self.files[out_name] = out_file
@@ -957,7 +959,18 @@ class SpecScience:
             )
 
         return aligned_cube
+    
+    def get_pa(self, wcs_name):
 
+        if self.wcs[wcs_name].wcs.has_cd():
+            M = self.wcs[wcs_name].wcs.cd
+        else:
+            pc = self.wcs[wcs_name].wcs.get_pc()
+            cdelt = self.wcs[wcs_name].wcs.cdelt
+            M = pc @ np.diag(cdelt)
+
+        return np.degrees(np.arctan2(M[0,0], M[1,0]))
+        
     def get_pix_area(self, name):
         """
         Return pixel area in steradians.
@@ -1102,7 +1115,7 @@ class SpecScience:
 
         flux_density_spectrum = []
         nan_detected = 0
-        for i in range(len(cube.spectral_axis)):
+        for i in range(len(self.wavelengths[name])):
             image_quantity = cube[i]
             if replace_negatives is not False:
                 if replace_negatives == 0:
@@ -1112,7 +1125,7 @@ class SpecScience:
                     image_quantity[image_quantity < 0] = min_positive
                 
             if ~np.isnan(image_quantity).sum() == 0:
-                print(f'The entire wavelength slice for slice {i}:{cube.spectral_axis[i]} in the cube is NaNs')
+                print(f'The entire wavelength slice for slice {i}:{self.wavelengths[name][i]} in the cube is NaNs')
 
             if background_annulus_thickness > 0:
                 annulus_data = annulus_mask.multiply(image_quantity.value)
@@ -1143,7 +1156,7 @@ class SpecScience:
             flux_density_spectrum.append(net_flux.value)
         units = net_flux.unit
         flux_density_spectrum = np.array(flux_density_spectrum)*units
-        wavelength = cube.spectral_axis.to(u.m)
+        wavelength = self.wavelengths[name].to(u.m)
         frequency = (c / wavelength).to(u.Hz)
 
         F_lambda = (flux_density_spectrum * c / wavelength ** 2).to(u.W / (u.m ** 2 * u.m))
@@ -1168,7 +1181,7 @@ class SpecScience:
         print(f'spectra saved to {self}.spectra[{out_name}]')
         return spectrum
 
-    def apply_filter(self, spec_name, filter_name, warnings = True, counter = 'energy', out_name=None):
+    def apply_filter(self, spec_name, filter_name, warnings = True, counter = 'photons', out_name=None):
         '''get expected flux through filter. Assumes Fnu array is in W/m2/Hz and wl array is in meters. Otherwise, units will be weird.
         -------------
         
@@ -1180,28 +1193,30 @@ class SpecScience:
         total_flux : type = float - Ideally in units of W/m2
         '''
         Fnu_array = self.spectra[spec_name]['F_nu']
+        Fnu_array = np.nan_to_num(Fnu_array, nan=0.0)
+
         wl_array = self.spectra[spec_name]['wavelength']
-        trans_wl_array, transmission_array = get_filter_data(filter_name)
+        filter_wl_array, transmission_array = get_filter_data(filter_name)
 
         try:
             Fnu_units = Fnu_array.unit
         except:
             print('first argument of apply_filter() must have units')
             return None
-        if ((trans_wl_array[0] < wl_array[0]) or (trans_wl_array[-1] > wl_array[-1])): #TJ Check if wavelengths are compatible with filter
+        if ((filter_wl_array[0] < wl_array[0]) or (filter_wl_array[-1] > wl_array[-1])): #TJ Check if wavelengths are compatible with filter
             if warnings:
-                print(f'filter goes from {trans_wl_array[0]} to {trans_wl_array[-1]}, but provided Fnu array goes from {wl_array[0]} to {wl_array[-1]}')
-            idx_start = np.searchsorted(trans_wl_array, wl_array[0], side='left')
-            idx_end = np.searchsorted(trans_wl_array, wl_array[-1], side='right')
+                print(f'filter goes from {filter_wl_array[0]} to {filter_wl_array[-1]}, but provided Fnu array goes from {wl_array[0]} to {wl_array[-1]}')
+            idx_start = np.searchsorted(filter_wl_array, wl_array[0], side='left')
+            idx_end = np.searchsorted(filter_wl_array, wl_array[-1], side='right')
             
             # Expand by one index if possible
             idx_start = max(0, idx_start - 1)  # Include one lower index
-            idx_end = min(len(trans_wl_array), idx_end + 1)  # Include one higher index
+            idx_end = min(len(filter_wl_array), idx_end + 1)  # Include one higher index
             
             # Slice transmission data
-            trans_wl_array = trans_wl_array[idx_start:idx_end]
+            filter_wl_array = filter_wl_array[idx_start:idx_end]
             transmission_array = transmission_array[idx_start:idx_end]
-        if len(trans_wl_array) == 0:
+        if len(filter_wl_array) == 0:
             raise ValueError("No overlap between flux wavelengths and filter transmission curve")
         #TJ convert all arrays to numpy arrays for better indexing and convert to MKS units
 
@@ -1214,25 +1229,42 @@ class SpecScience:
         Fnu_array = np.array(Fnu_array)
         wl_array = np.array(wl_array)
         transmission_array = np.array(transmission_array)
-        trans_wl_array = np.array(trans_wl_array)
+        filter_wl_array = np.array(filter_wl_array)
 
-        
         #TJ Convert wavelength to frequency, reverse so freq increases left to right
         spec_freq_array = c / wl_array[::-1]
         Fnu_array = Fnu_array[::-1]
-        trans_freq_array = c / trans_wl_array[::-1]
+        filter_freq_array = c / filter_wl_array[::-1]
         transmission_array = transmission_array[::-1]
 
         #TJ Interpolate Fnu onto the transmission frequency grid
         #TJ this is because jwst transmission arrays are averages over BW widths which are much coarser than Fnu is.
-        interp_Fnu = np.interp(trans_freq_array, spec_freq_array, Fnu_array)
-        
-        if counter == 'photons':
-            weight = transmission_array / trans_freq_array #TJ weight the numerator and denominator by T *d_nu over nu for integration
-        elif counter == 'energy':
-            weight = transmission_array    
-        numerator = np.trapezoid(interp_Fnu * weight, trans_freq_array)#TJ perform integration
-        denominator = np.trapezoid(weight, trans_freq_array)
+        trans_interp = np.interp(
+            spec_freq_array,
+            filter_freq_array,
+            transmission_array,
+            left=0.0,
+            right=0.0
+        )
+
+        if counter.lower() in ("photon", "photons", 'phot'):
+            weight = trans_interp / spec_freq_array
+        elif counter.lower() in ("energy", 'e'):
+            weight = trans_interp
+        else:
+            raise ValueError("counter must be 'energy' or 'photon'")
+
+        numerator = np.trapezoid(
+            Fnu_array * weight,
+            x=spec_freq_array,
+            axis=0
+        )
+
+        denominator = np.trapezoid(
+            weight,
+            x=spec_freq_array
+        )
+
         ab_mean_flux = numerator / denominator
         # Numerator: Fν * Transmission / nu integrated over frequency
         if out_name is None:
@@ -1247,8 +1279,8 @@ class SpecScience:
         self.data[out_name] = ab_mean_flux*Fnu_units
         print(f'data saved to self.data[{out_name}]')
         return ab_mean_flux*Fnu_units
-            
-    def create_synthetic_image(self, cube_name, filter_name, warnings=True, counter='energy', out_name=None, out_file=None):
+
+    def create_synthetic_image(self, cube_name, filter_name, warnings=True, counter='photon', out_name=None, out_file=None):
         """
         Apply a filter transmission curve to every spaxel in a cube, producing
         a synthetic image of the filter-weighted mean flux.
@@ -1272,7 +1304,7 @@ class SpecScience:
             cube_data = cube.unmasked_data[:].to(cube_units).value
             cube_data= np.nan_to_num(cube_data, nan=0.0)
             # ascending frequency axis
-            freq = (c/cube.spectral_axis).to(u.Hz)
+            freq = (c/self.wavelengths[name]).to(u.Hz)
             cube_data = cube_data[::-1]
 
             # ∫Fν dν
@@ -1305,8 +1337,9 @@ class SpecScience:
             cube_units = cube.unit
 
             # --- get cube as plain (nz, ny, nx) numpy array ---
-            cube_data = np.array(cube.unmasked_data[:].to(cube_units))  # (nz, ny, nx)
-            wl_array  = np.array(cube.spectral_axis.to(u.m).value)      # (nz,)
+            cube_data = cube.unmasked_data[:].to(cube_units).value
+            cube_data = np.nan_to_num(cube_data, nan=0.0)
+            wl_array  = np.array(self.wavelengths[cube_name].to(u.m).value)      # (nz,)
 
             # --- load and trim transmission curve to cube wavelength range ---
             filter_wl_array, transmission_array = get_filter_data(filter_name)
@@ -1317,56 +1350,62 @@ class SpecScience:
                 if warnings:
                     print(f'filter goes from {filter_wl_array[0]:.4e} to {filter_wl_array[-1]:.4e} m, '
                         f'but cube goes from {wl_array[0]:.4e} to {wl_array[-1]:.4e} m')
-                idx_start = max(0,                      np.searchsorted(filter_wl_array, wl_array[0],  side='left')  - 1)
-                idx_end   = min(len(filter_wl_array),    np.searchsorted(filter_wl_array, wl_array[-1], side='right') + 1)
-                filter_wl_array     = filter_wl_array[idx_start:idx_end]
+                idx_start = max(0, np.searchsorted(filter_wl_array, wl_array[0],  side='left') - 1)
+                idx_end   = min(len(filter_wl_array), np.searchsorted(filter_wl_array, wl_array[-1], side='right') + 1)
+                filter_wl_array = filter_wl_array[idx_start:idx_end]
                 transmission_array = transmission_array[idx_start:idx_end]
 
             if len(filter_wl_array) == 0:
                 raise ValueError(f"No overlap between cube wavelengths and filter '{filter_name}'")
 
-            # --- convert everything to frequency, reversed so freq is ascending ---
-            spec_freq_array  = (c.value / wl_array)[::-1]          # (nz,)  ascending freq
-            cube_data        = cube_data[::-1, :, :]                      # (nz, ny, nx) matching order
-            trans_freq_array = (c.value / filter_wl_array)[::-1]    # (nf,)  ascending freq
-            transmission_array = transmission_array[::-1]                 # (nf,)
+            spec_freq_array = (c.value / wl_array)[::-1]        # (nz,)
+            cube_data = cube_data[::-1, :, :]                   # (nz, ny, nx)
 
-            # --- interpolate every spaxel onto the filter frequency grid ---
-            # cube_data is (nz, ny, nx); we need (nf, ny, nx)
-            nz, ny, nx = cube_data.shape
-            nf         = len(trans_freq_array)
+            filter_freq_array = (c.value / filter_wl_array)[::-1]
+            transmission_array = transmission_array[::-1]
 
-            # Reshape to (nz, ny*nx) so np.interp can be vectorised with a single loop over filter points
-            cube_flat = cube_data.reshape(nz, ny * nx)   # (nz, npix)
+            # ------------------------------------------------------------------
+            # Interpolate FILTER onto the cube sampling
+            # ------------------------------------------------------------------
 
-            # np.interp doesn't broadcast over xp/fp so we interpolate in bulk:
-            # For each filter freq point, linearly interpolate across the spectral axis for all spaxels.
-            # np.searchsorted gives the bracketing indices; then we do the linear interp manually.
-            idx = np.searchsorted(spec_freq_array, trans_freq_array)   # (nf,)
-            idx = np.clip(idx, 1, nz - 1)
+            trans_interp = np.interp(
+                spec_freq_array,
+                filter_freq_array,
+                transmission_array,
+                left=0.0,
+                right=0.0
+            )
 
-            f0 = spec_freq_array[idx - 1]   # (nf,)
-            f1 = spec_freq_array[idx]        # (nf,)
-            df = f1 - f0                     # (nf,)
+            # ------------------------------------------------------------------
+            # Construct weighting function
+            # ------------------------------------------------------------------
 
-            # Broadcasting: t shape (nf,1), cube_flat rows indexed by idx shape (nf, npix)
-            t  = ((trans_freq_array - f0) / np.where(df == 0, 1, df))[:, np.newaxis]  # (nf, 1)
-            fl_lo = cube_flat[idx - 1, :]   # (nf, npix)
-            fl_hi = cube_flat[idx,     :]   # (nf, npix)
-            interp_cube = fl_lo + t * (fl_hi - fl_lo)                   # (nf, npix)
+            if counter.lower() in ("photon", "photons"):
+                weight = trans_interp / spec_freq_array
+            elif counter.lower() == "energy":
+                weight = trans_interp
+            else:
+                raise ValueError("counter must be 'energy' or 'photon'")
 
-            # --- filter-weighted integration over frequency axis ---
-            if counter == 'photons':
-                weight = (transmission_array / trans_freq_array)[:, np.newaxis]   # (nf, 1)
-            else:  # energy
-                weight = transmission_array[:, np.newaxis]                         # (nf, 1)
+            # reshape for broadcasting over image dimensions
+            weight3d = weight[:, None, None]
 
-            # np.trapz integrates along axis=0 (the frequency axis)
-            numerator   = np.trapezoid(interp_cube * weight, trans_freq_array[:, np.newaxis], axis=0)  # (npix,)
-            denominator = np.trapezoid(weight,               trans_freq_array[:, np.newaxis], axis=0)  # scalar or (1,)
+            # ------------------------------------------------------------------
+            # Perform filter-weighted integration
+            # ------------------------------------------------------------------
 
-            synth_flat = numerator / denominator                 # (npix,)
-            synth_image = synth_flat.reshape(ny, nx) * cube_units
+            numerator = np.trapezoid(
+                cube_data * weight3d,
+                x=spec_freq_array,
+                axis=0
+            )
+
+            denominator = np.trapezoid(
+                weight,
+                x=spec_freq_array
+            )
+
+            synth_image = (numerator / denominator) * cube_units
             if out_name is None:
                 if f'synth_{filter_name}' not in self.data:
                     out_name = f'synth_{filter_name}'
@@ -1512,7 +1551,7 @@ class SpecScience:
             x_img, y_img = cutout.wcs.world_to_pixel(loc_sky)
             pixels = cutout.data[np.isfinite(cutout.data)]
             med, sig = np.nanmedian(pixels), np.nanstd(pixels)
-            norm = colors.Normalize(vmin=med - 3*sig, vmax=med + 20*sig)
+            norm = colors.Normalize(vmin=0, vmax=np.percentile(cutout.data, 99))
             im = ax.imshow(cutout.data, origin='lower', cmap=cmap,
                     norm=norm)
 
@@ -1534,7 +1573,7 @@ class SpecScience:
 
         plt.tight_layout()
         plt.show()
-
+    
     def append_cubes(self, cube_names, wl_range=None, out_name=None):
         """
         Reproject and spectrally concatenate two cubes onto a common pixel grid.
@@ -1560,8 +1599,17 @@ class SpecScience:
             raise ValueError("append_cubes expects exactly two cube names")
 
         name_a, name_b = cube_names
-        cube_a = self.cubes[name_a]
-        cube_b = self.cubes[name_b]
+        if self.wavelengths[name_a][0] < self.wavelengths[name_b][0]:
+            cube_a = self.cubes[name_a]
+            cube_b = self.cubes[name_b]
+            wl_a = self.wavelengths[name_a]
+            wl_b = self.wavelengths[name_b]
+        else:
+            cube_a = self.cubes[name_b]
+            cube_b = self.cubes[name_a]
+            wl_a = self.wavelengths[name_b]
+            wl_b = self.wavelengths[name_a]
+            name_a, name_b = name_b, name_a
 
         # --- check units are compatible ---
         if cube_a.unit != cube_b.unit:
@@ -1572,10 +1620,9 @@ class SpecScience:
         # --- optionally trim each cube to wl_range before reprojection ---
         # (reduces memory and reprojection time significantly for large cubes)
         if wl_range is not None:
-            print('wavelength cropping function not available, just use full cubes')
+            print('wavelength cropping function not available, just use full cubes for now')
             wl_min, wl_max = wl_range[0].to(u.m), wl_range[1].to(u.m)
-            wl_a = cube_a.spectral_axis.to(u.m)
-            wl_b = cube_b.spectral_axis.to(u.m)
+
             mask_a = (wl_a >= wl_min) & (wl_a <= wl_max)
             mask_b = (wl_b >= wl_min) & (wl_b <= wl_max)
             cube_a = cube_a[(wl_a >= wl_min) & (wl_a <= wl_max)]
@@ -1598,8 +1645,8 @@ class SpecScience:
 
         # --- interpolate cube_b onto cube_a's spectral grid and average in overlap ---
         cube_a_data = np.array(cube_a.unmasked_data[:].value)   # (nz_a, ny, nx)
-        wl_a_vals   = cube_a.spectral_axis.to(u.m).value        # (nz_a,)
-        wl_b_vals   = cube_b.spectral_axis.to(u.m).value        # (nz_b,)
+        wl_a_vals   = wl_a.to_value(u.m)        # (nz_a,)
+        wl_b_vals   = wl_b.to_value(u.m)        # (nz_b,)
 
         overlap_min = max(wl_a_vals[0],  wl_b_vals[0])
         overlap_max = min(wl_a_vals[-1], wl_b_vals[-1])
@@ -1684,18 +1731,18 @@ class SpecScience:
             meta  = {'name': f'{name_a}+{name_b}'}
         )
         if out_name is None:
-            if cube_names[0]+cube_names[1] not in self.data:
+            if cube_names[0]+cube_names[1] not in self.cubes:
                 out_name = cube_names[0]+cube_names[1]
             else:
                 count = 1
-                while out_name in self.data:
+                while out_name in self.cubes:
                     out_name = cube_names[0]+cube_names[1]+f'_{count}'
                     count+=1
         self.cubes[out_name]   = combined_cube
         self.headers[out_name] = new_header
         self.wcs[out_name]     = new_wcs
-
-        print(f"Stored combined cube under '{out_name}': ")
+        self.wavelengths[out_name] = all_wl*u.m
+        print(f"Stored combined cube under '{out_name}': \nNew cube goes from{self.wavelengths[out_name][0]} to {self.wavelengths[out_name][-1]}")
         return combined_cube
 
     def which_cubes(self, filter_name):
@@ -1717,7 +1764,7 @@ class SpecScience:
         covering = []
 
         for key in list(self.cubes.keys()):
-            wl = self.cubes[key].spectral_axis
+            wl = self.wavelengths[key]
             if wl[0] <= filt_hi and wl[-1] >= filt_lo:
                 covering.append(key)
 
@@ -1757,18 +1804,27 @@ class SpecScience:
                     if (obj.spectral_axis[-1] > wl[0]) and (obj.spectral_axis[0] < wl[-1]):
                         keep.append(fil)
 
-                if type(obj) == dict:
+                elif type(obj) == dict:
                     if (obj['wavelength'][-1] > wl[0]) and (obj['wavelength'][0] < wl[-1]):
                         keep.append(fil)
-
+                elif type(obj.value) == np.ndarray:
+                    if (obj[-1] > wl[0]) and (obj[0] < wl[-1]):
+                        keep.append(fil)
+                else:
+                    print(f'type {type(obj)} not recognized as SpectralCube, dict, or np.ndarray')
             else:
                 if type(obj) == SpectralCube:                    
                     if (obj.spectral_axis[0] > wl[0]) and (obj.spectral_axis[-1] < wl[-1]):
                         keep.append(fil)
 
-                if type(obj) == dict:
+                elif type(obj) == dict:
                     if (obj['wavelength'][0] > wl[0]) and (obj['wavelength'][-1] < wl[-1]):
                         keep.append(fil)
+                elif type(obj.value) == np.ndarray:
+                    if (obj[0] > wl[0]) and (obj[-1] < wl[-1]):
+                        keep.append(fil)
+                else:
+                    print(f'type {type(obj)} not recognized as SpectralCube, dict, or np.ndarray')
         return keep
     
     def adjust_spectrum(self, name, filter_name, image_obj, image_name, location, radius, adjustment_operation = 'add', out_name=None):
@@ -1884,11 +1940,19 @@ class SpecScience:
         with open(path, 'wb') as f:
             pickle.dump(self.spectra, f)
 
-    def load_spectra(self, path):
+    def load_all_spectra(self, path):
         import pickle
         with open(path, 'rb') as f:
             self.spectra = pickle.load(f)
 
+    def import_spec_data(self, name, filepath):
+        '''Import already extracted spectra from a txt file and save as self.spectra[name]'''
+        wl, fnu = np.genfromtxt(filepath)
+        wl = wl*1e-6*u.m
+        fnu
+        frequency = (c / wavelength).to(u.Hz)
+        
+        F_lambda = (flux_density_spectrum * c / wavelength ** 2).to(u.W / (u.m ** 2 * u.m))
     @classmethod
     def load_science(cls, filename):
         """

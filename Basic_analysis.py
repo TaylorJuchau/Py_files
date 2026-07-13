@@ -75,9 +75,6 @@ def voigt(x, amp, center, sigma, gamma):
     return amp * profile / np.max(profile)
 
 
-import numpy as np
-
-
 def get_continuum_around(wavelength_array, flux_array, feature_index, window_size=25, iqr_mult=1.5):
     '''Calculates the surrounding continuum around a feature using robust statistics.
 

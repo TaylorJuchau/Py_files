@@ -356,6 +356,17 @@ class ImageScience:
             out_file
         )
 
+    def get_pa(self, wcs_name):
+
+        if self.wcs[wcs_name].wcs.has_cd():
+            M = self.wcs[wcs_name].wcs.cd
+        else:
+            pc = self.wcs[wcs_name].wcs.get_pc()
+            cdelt = self.wcs[wcs_name].wcs.cdelt
+            M = pc @ np.diag(cdelt)
+
+        return np.degrees(np.arctan2(M[0,0], M[1,0]))
+
     def sum_images(self, name1, name2, out_name=None, out_file=None, scales=[1,1]):
         '''
         Sum two images with the same shape.
@@ -1356,34 +1367,36 @@ class ImageScience:
         
     def make_ew_ratio_image(
         self,
-        halpha_continuum_name,
-        halpha_line_name,
-        paalpha_continuum_name,
-        paalpha_line_name,
+        numerator_continuum_name,
+        numerator_line_name,
+        denominator_continuum_name,
+        denominator_line_name,
         output_name='EW_Ha_over_PaA',
         min_continuum=0,
-        min_line=0
+        min_line=0,
+        replace_num_negs = False,
+        replace_den_negs = False
     ):
         """
-        Create an image of
+        Create an image of the ratio of equivalent widths, for example:
 
             EW(Hα) / EW(Paα)
 
-        from continuum and continuum-subtracted images.
+        from continuum and continuum-subtracted images, assumed to already be reprojected.
 
         Parameters
         ----------
-        halpha_continuum_name : str
-            Name of Hα continuum image.
+        numerator_continuum_name : str
+            Name of numerator continuum image.
 
-        halpha_line_name : str
-            Name of continuum-subtracted Hα image.
+        numerator_line_name : str
+            Name of continuum-subtracted numerator image.
 
-        paalpha_continuum_name : str
-            Name of Paα continuum image.
+        denominator_continuum_name : str
+            Name of denominator continuum image.
 
-        paalpha_line_name : str
-            Name of continuum-subtracted Paα image.
+        denominator_line_name : str
+            Name of continuum-subtracted denominator image.
 
         output_name : str
             Name used to store the output image.
@@ -1400,36 +1413,42 @@ class ImageScience:
             EW(Hα)/EW(Paα)
         """
 
-        ha_cont = self.images[halpha_continuum_name].astype(float)
-        ha_line = self.images[halpha_line_name].astype(float)
+        numerator_cont = self.images[numerator_continuum_name].astype(float)
+        numerator_line = self.images[numerator_line_name].astype(float)
+        
+        denominator_cont = self.images[denominator_continuum_name].astype(float)
+        denominator_line = self.images[denominator_line_name].astype(float)
 
-        pa_cont = self.images[paalpha_continuum_name].astype(float)
-        pa_line = self.images[paalpha_line_name].astype(float)
+        numerator_EW = np.full_like(numerator_cont, np.nan, dtype=float)
+        denominator_EW = np.full_like(denominator_cont, np.nan, dtype=float)
+        ratio = np.full_like(denominator_cont, np.nan, dtype=float)
 
-        ratio = np.full_like(ha_cont, np.nan, dtype=float)
+        numerator_EW = (numerator_line / numerator_cont)
+        denominator_EW = (denominator_line / denominator_cont)
+        if replace_num_negs:
+            print(f'{len(numerator_EW[numerator_EW < 0])} zeros in the numerator image replaced with nans')
+            numerator_EW[numerator_EW < 0] = np.nan
+        if replace_den_negs:
+            print(f'{len(denominator_EW[denominator_EW < 0])} zeros in the denominator image replaced with nans')
+            denominator_EW[denominator_EW < 0] = np.nan
 
         valid = (
-            np.isfinite(ha_cont) &
-            np.isfinite(ha_line) &
-            np.isfinite(pa_cont) &
-            np.isfinite(pa_line) &
-            (ha_cont > min_continuum) &
-            (pa_cont > min_continuum) &
-            (ha_line > min_line) &
-            (pa_line > min_line)
+            np.isfinite(numerator_cont) &
+            np.isfinite(numerator_line) &
+            np.isfinite(denominator_cont) &
+            np.isfinite(denominator_line) &
+            np.isfinite(numerator_EW) &
+            np.isfinite(denominator_EW) &
+            (numerator_cont > min_continuum) &
+            (denominator_cont > min_continuum) &
+            (numerator_line > min_line) &
+            (denominator_line > min_line)
         )
-
-        ratio[valid] = (
-            ha_line[valid] *
-            pa_cont[valid]
-        ) / (
-            pa_line[valid] *
-            ha_cont[valid]
-        )
+        ratio[valid] = numerator_EW[valid] / denominator_EW[valid]
 
         self.images[output_name] = ratio
-        self.headers[output_name] = self.headers[halpha_line_name].copy()
-        self.wcs[output_name] = self.wcs[halpha_line_name]
+        self.headers[output_name] = self.headers[numerator_line_name].copy()
+        self.wcs[output_name] = self.wcs[numerator_line_name]
 
         self.headers[output_name]['BUNIT'] = 'dimensionless'
 
