@@ -10,6 +10,11 @@ import sys
 import pandas as pd
 import requests
 import shutil
+from regions import (
+    CircleSkyRegion,
+    RectangleSkyRegion,
+    Regions,
+)
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -50,7 +55,174 @@ warnings.filterwarnings("ignore", message="WCS1 is missing card .*")
 os.chdir('/cluster/medbow/project/galaxies/tjuchau/') #TJ change working directory to be the parent directory
 
 locations = [[202.5062429, 47.2143358], [202.4335225, 47.1729608], [202.4340450, 47.1732517], [202.4823742, 47.1958589]]
-print('Some functions use pre-defined data files, a warning will print when this is the case.')
+#print('Some functions use pre-defined data files, a warning will print when this is the case.')
+
+def flux_to_abmag(flux):
+    """
+    Convert spectral flux density to an AB magnitude.
+
+    Parameters
+    ----------
+    flux : astropy.units.Quantity
+        Spectral flux density with units equivalent to
+        W/m^2/Hz (or Jy, erg/s/cm^2/Hz, etc.).
+
+    Returns
+    -------
+    mag : float or ndarray
+        AB magnitude.
+    """
+
+    flux = flux.to(u.Jy)
+
+    mag = -2.5 * np.log10(flux.value / 3631.0)
+
+    return mag
+
+def make_region(locations, size, filepath, shape='circle', **kwargs):
+    """
+    Create a DS9 region file.
+
+    Parameters
+    ----------
+    locations : SkyCoord, tuple, or list of SkyCoord/tuple
+        Either a single location or an array of locations, each of which is:
+            SkyCoord(...)
+        or
+            (ra, dec)
+
+        If a tuple is supplied, values are assumed to be degrees.
+        A list can mix SkyCoords and tuples freely.
+
+    shape : str
+        Region shape. Currently supports:
+            'circle'
+            'square'
+            'rectangle'
+            'hexagon'
+            'pentagon'
+            'octagon'
+
+    size : Quantity
+        Radius for circles.
+        Side length for polygons/squares.
+        Width for rectangles (height given separately).
+        Applied to every location.
+
+    filepath : str
+        Output .reg filename.
+
+    **kwargs
+        rectangle:
+            height : Quantity
+
+        polygons:
+            angle : Quantity (default = 0 deg)
+    """
+
+    shape = shape.lower()
+
+    # ---------------------------------------------------------
+    # Normalize locations into a list
+    # ---------------------------------------------------------
+
+    #TJ treat a single SkyCoord (scalar, not an array of coords) or a single
+    #TJ (ra, dec) tuple as one location; anything else iterable is a list of locations
+    if isinstance(locations, SkyCoord):
+        if locations.isscalar:
+            locations = [locations]
+        else:
+            locations = list(locations)
+    elif (
+        isinstance(locations, tuple)
+        and len(locations) == 2
+        and np.isscalar(locations[0])
+    ):
+        locations = [locations]
+    else:
+        locations = list(locations)
+
+    regions = []
+
+    for location in locations:
+
+        # -------------------------------------------------
+        # Parse location
+        # -------------------------------------------------
+
+        if not isinstance(location, SkyCoord):
+            ra, dec = location
+            location = SkyCoord(
+                ra=ra * u.deg,
+                dec=dec * u.deg,
+                frame="icrs"
+            )
+
+        # -------------------------------------------------
+        # Circle
+        # -------------------------------------------------
+
+        if shape == "circle":
+
+            region = CircleSkyRegion(
+                center=location,
+                radius=size
+            )
+
+        # -------------------------------------------------
+        # Square
+        # -------------------------------------------------
+
+        elif shape == "square":
+
+            region = RectangleSkyRegion(
+                center=location,
+                width=size,
+                height=size,
+                angle=kwargs.get("angle", 0 * u.deg)
+            )
+
+        # -------------------------------------------------
+        # Rectangle
+        # -------------------------------------------------
+
+        elif shape == "rectangle":
+
+            region = RectangleSkyRegion(
+                center=location,
+                width=size,
+                height=kwargs["height"],
+                angle=kwargs.get("angle", 0 * u.deg)
+            )
+
+        # -------------------------------------------------
+        # Regular polygons
+        # -------------------------------------------------
+
+        elif shape in ["pentagon", "hexagon", "octagon"]:
+
+            nverts = {
+                "pentagon": 5,
+                "hexagon": 6,
+                "octagon": 8
+            }[shape]
+
+            region = RegularPolygonSkyRegion(
+                center=location,
+                nvertices=nverts,
+                radius=size,
+                angle=kwargs.get("angle", 0 * u.deg)
+            )
+
+        else:
+            raise ValueError(f"Unsupported shape '{shape}'")
+
+        regions.append(region)
+
+    Regions(regions).write(filepath, format="ds9", overwrite=True)
+
+    print(f"Saved {len(regions)} region(s) to {filepath}")
+
 
 def extract_filter_name(filepath):
     """
@@ -121,8 +293,6 @@ def collect_M51_image_and_filter_files(filter_directory, image_directory):
     return sorted_image_files, sorted_filter_names
 
 
-
-
 def try_float(x):
     '''Try to convert item to float, if that fails, leave it as the type that it is, likely a string
     -------------
@@ -178,8 +348,6 @@ def voigt(x, amp, center, sigma, gamma):
     '''
     profile = voigt_profile(x - center, sigma, gamma)
     return amp * profile / np.max(profile)
-
-
 
 
 def get_continuum_around(wavelength_array, flux_array, feature_index, window_size=25, iqr_mult=1.5):
@@ -842,7 +1010,7 @@ def get_filter_data(filter_name, aux_info=False, cache_dir="/project/galaxies/tj
         return wl.to(u.m), transmission, eff_width, pivot_wl, mean_wl
 
     #TJ query SVO server for filter data
-    print('Filter not found in cache, querying SVO website for filte data...')
+    print(f'{filter_name} filter not found in cache, querying SVO website for filter data...')
     filter_id = filter_to_svo(filter_name)
 
     url = (

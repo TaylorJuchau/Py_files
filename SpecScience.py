@@ -20,6 +20,8 @@ from astropy.wcs.utils import proj_plane_pixel_scales
 from scipy.ndimage import rotate as ndimage_rotate
 from scipy.ndimage import zoom
 
+from scipy.ndimage import median_filter
+
 import warnings
 from typing import Optional
 from astropy.coordinates import SkyCoord
@@ -1417,17 +1419,412 @@ class SpecScience:
             self.images[out_name] = synth_image
             self.wcs[out_name] = self.wcs[cube_name].celestial
             print(f'images and wcs saved to self.images/wcs[{out_name}]')
+            header = self.cubes[cube_name].wcs.celestial.to_header()
+
+            header["BUNIT"] = str(cube_units)
+            header["FILTER"] = filter_name
+            header["FROMCUBE"] = cube_name
+            self.headers[out_name] = header
+            if out_file is not None:
+
+                hdu = fits.PrimaryHDU(
+                    data=self.images[out_name].value,
+                    header=header
+                )
+
+                hdu.writeto(out_file, overwrite=True)
+
+
+                print(f'Saved synthetic image to : {out_file}')
+        return synth_image
+
+    def create_new_continuum_image(
+        self,
+        cube_name,
+        wavelength,
+        search_width=0.5*u.micron,
+        window_width=0.1*u.micron,
+        sigma_clip=3,
+        fit_order=1,
+        out_name=None,
+        out_file=None
+    ):
+        """
+        Estimate a continuum image at a given wavelength using robust
+        continuum windows.
+
+        The algorithm is fully vectorized across all spatial pixels.
+
+        Parameters
+        ----------
+        cube_name : str
+
+        wavelength : Quantity
+
+        search_width : Quantity
+
+        window_width : Quantity
+
+        sigma_clip : float
+
+        fit_order : int
+            Currently supports 0 or 1.
+
+        out_name : str or None
+
+        Returns
+        -------
+        continuum_image : Quantity
+        """
+
+        cube = self.cubes[cube_name]
+        cube_unit = cube.unit
+
+        data = cube.unmasked_data[:].to_value(cube_unit)
+        data = np.nan_to_num(data)
+
+        wl = self.wavelengths[cube_name].to(u.micron).value
+        target = wavelength.to(u.micron).value
+
+        nz, ny, nx = data.shape
+        npix = ny * nx
+
+        cube2d = data.reshape(nz, npix)
+
+        ###############################################################
+        # Limit search region to cube coverage
+        ###############################################################
+
+        search = search_width.to(u.micron).value
+        dw = window_width.to(u.micron).value
+
+        left_edge = max(wl.min(), target-search)
+        right_edge = min(wl.max(), target+search)
+
+        centers = np.arange(left_edge, right_edge+dw, dw)
+
+        ###############################################################
+        # Build window masks once
+        ###############################################################
+
+        masks = []
+
+        valid_centers = []
+
+        for center in centers:
+
+            m = np.abs(wl-center) < dw/2
+
+            if np.sum(m) >= 5:
+
+                masks.append(m)
+
+                valid_centers.append(center)
+
+        centers = np.asarray(valid_centers)
+
+        nwin = len(centers)
+
+        if nwin < fit_order+2:
+            raise RuntimeError("Not enough continuum windows.")
+
+        ###############################################################
+        # Compute robust statistics
+        ###############################################################
+
+        medians = np.empty((nwin, npix))
+        mads = np.empty((nwin, npix))
+
+        for i, mask in enumerate(masks):
+
+            vals = cube2d[mask]
+
+            med = np.median(vals, axis=0)
+
+            mad = 1.4826*np.median(
+                np.abs(vals-med),
+                axis=0
+            )
+
+            medians[i] = med
+            mads[i] = mad
+
+        ###############################################################
+        # Reject windows containing emission/absorption features
+        ###############################################################
+
+        median_mad = np.median(mads, axis=0)
+
+        good = mads < sigma_clip*median_mad
+
+        ###############################################################
+        # Constant continuum
+        ###############################################################
+
+        if fit_order == 0:
+
+            continuum = np.nanmedian(
+                np.where(good, medians, np.nan),
+                axis=0
+            )
+
+        ###############################################################
+        # Linear continuum
+        ###############################################################
+
+        elif fit_order == 1:
+
+            x = centers[:, None]
+
+            w = good.astype(float)
+
+            S = np.sum(w, axis=0)
+
+            Sx = np.sum(w*x, axis=0)
+
+            Sy = np.sum(w*medians, axis=0)
+
+            Sxx = np.sum(w*x*x, axis=0)
+
+            Sxy = np.sum(w*x*medians, axis=0)
+
+            denom = S*Sxx - Sx*Sx
+
+            continuum = np.full(npix, np.nan)
+
+            valid = (S >= 2) & (np.abs(denom) > 0)
+
+            slope = np.zeros(npix)
+
+            intercept = np.zeros(npix)
+
+            slope[valid] = (
+                S[valid]*Sxy[valid]
+                - Sx[valid]*Sy[valid]
+            ) / denom[valid]
+
+            intercept[valid] = (
+                Sy[valid]
+                - slope[valid]*Sx[valid]
+            ) / S[valid]
+
+            continuum[valid] = (
+                intercept[valid]
+                + slope[valid]*target
+            )
+
+        else:
+
+            raise NotImplementedError(
+                "Only fit_order=0 or 1 currently supported."
+            )
+
+        ###############################################################
+        # Save
+        ###############################################################
+
+        continuum_image = continuum.reshape(ny, nx)*cube_unit
+
+        if out_name is not None:
+
+            self.images[out_name] = continuum_image
+
+            self.wcs[out_name] = self.wcs[cube_name].celestial
+
+            header = self.cubes[cube_name].wcs.celestial.to_header()
+
+            header["BUNIT"] = str(cube_unit)
+            header["IM_TYPE"] = 'Continuum Image'
+            header["FROMCUBE"] = cube_name
+            self.headers[out_name] = header
+            if out_file is not None:
+
+                hdu = fits.PrimaryHDU(
+                    data=self.images[out_name].value,
+                    header=header
+                )
+
+                hdu.writeto(out_file, overwrite=True)
+
+        return continuum_image
+
+    def create_continuum_image(
+        self,
+        cube_name,
+        wavelength,
+        search_width=0.4*u.micron,
+        median_width=0.05*u.micron,
+        sigma_clip=3.0,
+        fit_order=1,
+        out_name=None,
+        out_file=None,
+    ):
+        """
+        Estimate a continuum image by masking emission/absorption lines and
+        fitting the remaining local continuum.
+
+        Parameters
+        ----------
+        cube_name : str
+
+        wavelength : Quantity
+
+        search_width : Quantity
+            Width of the fitting region centered on the desired wavelength.
+
+        median_width : Quantity
+            Width of the median filter used to estimate the continuum.
+
+        sigma_clip : float
+            Threshold for masking spectral features.
+
+        fit_order : int
+            0 = constant
+            1 = linear
+
+        Returns
+        -------
+        continuum_image : Quantity
+        """
+
+        cube = self.cubes[cube_name]
+        cube_unit = cube.unit
+
+        data = cube.unmasked_data[:].to_value(cube_unit)
+        wl = self.wavelengths[cube_name].to(u.micron).value
+
+        target = wavelength.to(u.micron).value
+
+        nz, ny, nx = data.shape
+        npix = ny * nx
+
+        cube2d = data.reshape(nz, npix)
+
+        ############################################################
+        # Median smoothing
+        ############################################################
+
+        dw = np.median(np.diff(wl))
+
+        width_pix = int(
+            np.round(
+                median_width.to_value(u.micron) / dw
+            )
+        )
+
+        width_pix = max(width_pix, 5)
+
+        if width_pix % 2 == 0:
+            width_pix += 1
+
+        smooth = median_filter(
+            cube2d,
+            size=(width_pix, 1),
+            mode="nearest"
+        )
+
+        ############################################################
+        # Robust sigma
+        ############################################################
+
+        residual = cube2d - smooth
+
+        mad = 1.4826 * np.nanmedian(
+            np.abs(residual),
+            axis=0
+        )
+
+        mad[mad == 0] = np.nanmedian(mad[mad > 0])
+
+        ############################################################
+        # Feature mask
+        ############################################################
+
+        mask = np.abs(residual) < sigma_clip * mad
+
+        ############################################################
+        # Restrict to local fitting region
+        ############################################################
+
+        left = max(wl.min(), target-search_width.to_value(u.micron))
+        right = min(wl.max(), target+search_width.to_value(u.micron))
+
+        local = (wl >= left) & (wl <= right)
+
+        mask &= local[:, None]
+
+        ############################################################
+        # Polynomial fit
+        ############################################################
+
+        continuum = np.full(npix, np.nan)
+
+        x = wl
+
+        if fit_order == 0:
+
+            continuum = np.nanmedian(
+                np.where(mask, cube2d, np.nan),
+                axis=0
+            )
+
+        elif fit_order == 1:
+
+            for i in range(npix):
+
+                good = mask[:, i]
+
+                if np.sum(good) < 4:
+                    continue
+
+                coeff = np.polyfit(
+                    x[good],
+                    cube2d[good, i],
+                    1
+                )
+
+                continuum[i] = np.polyval(
+                    coeff,
+                    target
+                )
+
+        else:
+
+            raise ValueError("Only fit_order=0 or 1 supported.")
+
+        ############################################################
+        # Save
+        ############################################################
+
+        continuum_image = continuum.reshape(ny, nx) * cube_unit
+
+        if out_name is not None:
+
+            self.images[out_name] = continuum_image
+            self.wcs[out_name] = self.wcs[cube_name].celestial
+
+            header = self.cubes[cube_name].wcs.celestial.to_header()
+
+            header["BUNIT"] = str(cube_unit)
+            header["IM_TYPE"] = "Continuum Image"
+            header["FROMCUBE"] = cube_name
+            header["CONTWL"] = target
+            header["FITORD"] = fit_order
+            header["SIGCLIP"] = sigma_clip
+
+            self.headers[out_name] = header
 
             if out_file is not None:
-                hdu = fits.PrimaryHDU(data=self.images[image_name], header=self.headers[image_name])
 
-                hdu.writeto(
+                fits.PrimaryHDU(
+                    continuum_image.value,
+                    header
+                ).writeto(
                     out_file,
                     overwrite=True
                 )
 
-                print(f'Saved synthetic image to : {out_file}')
-        return synth_image
+        return continuum_image
 
     def stitch_spectra(self, names, anchor_idx=0, method='add_shift', out_name=None):
         """
@@ -1934,6 +2331,46 @@ class SpecScience:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         print(f"Saved SpecScience object to {filename}")
+    
+    def save_cube(self, cube_name, filename, overwrite=True):
+        """
+        Save a cube to a FITS file.
+
+        Parameters
+        ----------
+        cube_name : str
+            Name of cube in self.cubes.
+
+        filename : str
+            Output FITS filename.
+
+        overwrite : bool
+            Overwrite existing file.
+        """
+
+        cube = self.cubes[cube_name]
+
+        # Convert Quantity -> ndarray
+        data = cube.unmasked_data[:].value.astype(np.float32)
+
+        # Build header from cube WCS
+        header = cube.wcs.to_header()
+
+        # Preserve units
+        header["BUNIT"] = str(cube.unit)
+
+        # Store wavelength units for convenience
+        if cube_name in self.wavelengths:
+            header["WAVEUNIT"] = str(self.wavelengths[cube_name].unit)
+
+        hdu = fits.PrimaryHDU(
+            data=data,
+            header=header
+        )
+
+        hdu.writeto(filename, overwrite=overwrite)
+
+        print(f"Saved cube '{cube_name}' to {filename}")
 
     def save_spectra(self, path):
         import pickle

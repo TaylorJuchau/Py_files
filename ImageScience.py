@@ -1,28 +1,44 @@
 import os
 import numpy as np
-import matplotlib.pyplot as plt
 import glob
-from astropy.io import fits
+import time
+from time import sleep
+
 from matplotlib.widgets import Slider
-from astropy.table import Table
-import astropy.units as u
-from astropy import constants as const
+import matplotlib.pyplot as plt
+
+from Functions import *
 
 from reproject import reproject_interp
+
 from scipy.ndimage import fourier_shift
-from skimage.registration import phase_cross_correlation
-from Functions import *
-from astropy.wcs import WCS
-from reproject import reproject_interp as rpj
-from astropy.convolution import convolve, convolve_fft
 from scipy.ndimage import zoom, shift as ndi_shift
-from photutils.centroids import centroid_quadratic
-import time
+
+from skimage.registration import phase_cross_correlation
+from reproject import reproject_interp as rpj
+
 from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
+from photutils.centroids import centroid_quadratic
+from photutils.detection import DAOStarFinder
+
+from astropy import constants as const
+from astropy.table import Table
+import astropy.units as u
+from astropy.io import fits
+from astropy.stats import sigma_clipped_stats
+from astropy.nddata import Cutout2D
+from astropy.coordinates import SkyCoord
+
+from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_area
 from astropy.wcs.utils import proj_plane_pixel_scales
+from astropy.wcs.utils import pixel_to_skycoord
 
-from astropy.visualization import ZScaleInterval
+from astropy.convolution import Gaussian2DKernel
+from astropy.convolution import convolve, convolve_fft
+
+from astropy.visualization import ZScaleInterval, LogStretch, ImageNormalize, AsinhStretch
+
 from scipy.optimize import curve_fit
 
 
@@ -57,13 +73,13 @@ def convert_to_fnu_sr(data, header, wcs):
 
     elif bunit == '1E-20 ERG/S/CM2/ARCSEC2':
         print('Cnverting data in image from 1e-20 ergs/s/cm2/arcsec2 to W/m2/Hz/sr')
-        f_lam = (data*1e20) * u.erg/u.s/u.cm**2/u.arcsec**2
+        f_lam = ((data*1e-20) / header['PHOTBW'])* u.erg/u.s/u.cm**2/u.arcsec**2/u.AA
         if 'Angstroms' in header.comments['PHOTPLAM']:
             pivot = (header['PHOTPLAM']*1e-10)*u.m #TJ units of angstroms in 
         else:
             print('Could not find units for PHOTPLAM in header')
-        f_nu = (f_lam.to(u.W/u.m**2/u.sr)) * pivot**2 / const.c
-
+        f_nu = (f_lam.to(u.W/u.m**2/u.sr/u.m)) * pivot**2 / const.c
+        data = f_nu.value
     elif bunit in ['ERG/S/CM2/PIXEL', 'ERG/S/CM2/PIX']:
 
         print('converting data in image from erg/s/cm2/pix to W/m2/Hz/sr')
@@ -135,7 +151,7 @@ def convert_to_fnu_sr(data, header, wcs):
     elif bunit == 'MJY/SR':
         print('converting data in image from MJy/sr to W/m2/hz/sr')
 
-        data = data * 1e6 * 1e-26
+        data = data * (u.MJy/u.sr).to(u.W/u.m**2/u.Hz/u.sr)
 
     # --------------------------------------------------
     # Jy/sr
@@ -143,7 +159,7 @@ def convert_to_fnu_sr(data, header, wcs):
     elif bunit == 'JY/SR':
         print('converting data in image from JY/sr to W/m2/hz/sr')
 
-        data = data * 1e-26
+        data = data * (u.Jy/u.sr).to(u.W/u.m**2/u.Hz/u.sr)
 
     # --------------------------------------------------
     # Jy/pixel
@@ -188,7 +204,7 @@ class ImageScience:
         self.files = {}
         self.wcs = {}
     
-    def load_image(self, name, filename, hdu=None):
+    def load_image(self, name, filename, hdu=None, clear_sip=False):
 
         """
         Load FITS image and convert to
@@ -227,6 +243,9 @@ class ImageScience:
 
         self.images[name] = data
         self.headers[name] = header
+        if clear_sip:
+            wcs.sip=None
+            print('Clear_SIP given in function, check that file name has drz in the title and ignore warning about inconsistent wcs info')
         self.wcs[name] = wcs
 
         print(
@@ -302,18 +321,16 @@ class ImageScience:
         self,
         reference_image,
         other_image,
-        out_file=None
+        out_file=None,
+        out_name=None
     ):
         '''
         Reproject other image into pixel grid of the reference image using WCS info
         '''
 
-        if out_file is None:
+        if out_name is None:
 
-            out_file = (
-                self.files[other_image]
-                .replace('.fits', '_aligned.fits')
-            )
+            out_name = f'{other_image}_aligned'
 
         print(
             f'Reprojecting {other_image} '
@@ -336,25 +353,158 @@ class ImageScience:
             self.wcs[reference_image],
             shape_out=target_shape
         )
+        if out_file is not None:
+            hdu = fits.PrimaryHDU(
+                data=reproj,
+                header=target_header.copy()
+            )
 
-        hdu = fits.PrimaryHDU(
-            data=reproj,
-            header=target_header.copy()
+            hdu.writeto(
+                out_file,
+                overwrite=True
+            )
+
+            print(f'Saved aligned image:')
+            print(out_file)
+        self.images[out_name] = reproj
+        self.headers[out_name] = target_header.copy()
+        self.wcs[out_name] = self.wcs[reference_image].copy()
+
+    def make_cutout(
+        self,
+        image_name,
+        size,
+        center=None,
+        out_name=None,
+        mode="trim",
+        fill_value=np.nan,
+    ):
+        """
+        Create a WCS-aware cutout of an image.
+
+        Parameters
+        ----------
+        image_name : str
+            Name of image stored in the ImageScience object.
+
+        size : Quantity or tuple of Quantities
+            Angular size of the cutout (e.g. 5*u.arcsec).
+
+        center : None, SkyCoord, tuple, optional
+            Center of the cutout.
+
+            Supported formats
+            -----------------
+            None
+                Uses the center of the image.
+
+            SkyCoord
+                Uses the supplied sky coordinate.
+
+            (ra, dec)
+                Quantities or floats (assumed degrees).
+
+            (x, y)
+                Pixel coordinates.
+
+        out_name : str, optional
+            If supplied, store the cutout in the ImageScience object.
+
+        mode : {"trim", "partial", "strict"}
+            Passed directly to Cutout2D.
+
+        fill_value : float
+            Used when mode="partial".
+
+        Returns
+        -------
+        cutout : Cutout2D
+        """
+
+        image = self.images[image_name]
+        wcs = self.wcs[image_name]
+        header = self.headers[image_name]
+
+        # ---------------------------------------------------------
+        # Determine center
+        # ---------------------------------------------------------
+
+        if center is None:
+
+            ny, nx = image.shape
+
+            center = pixel_to_skycoord(
+                (nx - 1) / 2,
+                (ny - 1) / 2,
+                wcs,
+            )
+
+        elif isinstance(center, SkyCoord):
+
+            pass
+
+        elif isinstance(center, (tuple, list)) and len(center) == 2:
+
+            a, b = center
+
+            # Sky coordinates
+            if isinstance(a, u.Quantity) or isinstance(b, u.Quantity):
+
+                center = SkyCoord(a, b)
+
+            elif (
+                np.issubdtype(type(a), np.floating)
+                and
+                np.issubdtype(type(b), np.floating)
+            ):
+
+                # Assume degrees
+                center = SkyCoord(
+                    a*u.deg,
+                    b*u.deg,
+                )
+
+            else:
+
+                # Pixel coordinates
+                center = (a, b)
+
+        else:
+
+            raise ValueError(
+                "center must be None, SkyCoord, "
+                "(ra,dec), or (x,y)"
+            )
+
+        # ---------------------------------------------------------
+        # Make cutout
+        # ---------------------------------------------------------
+
+        cutout = Cutout2D(
+            image,
+            position=center,
+            size=size,
+            wcs=wcs,
+            mode=mode,
+            fill_value=fill_value,
         )
 
-        hdu.writeto(
-            out_file,
-            overwrite=True
-        )
+        # ---------------------------------------------------------
+        # Store if requested
+        # ---------------------------------------------------------
 
-        print(f'Saved aligned image:')
-        print(out_file)
+        if out_name is not None:
 
-        # Reload into object
-        self.load_image(
-            f'{other_image}_aligned',
-            out_file
-        )
+            self.images[out_name] = cutout.data
+
+            self.wcs[out_name] = cutout.wcs
+
+            new_header = header.copy()
+            new_header.update(cutout.wcs.to_header())
+
+            self.headers[out_name] = new_header
+
+        return cutout
 
     def get_pa(self, wcs_name):
 
@@ -433,6 +583,8 @@ class ImageScience:
             image = (im1*scales[0])/(im2*scales[1])
         except ValueError:
             print('Images were not the same size')
+        if out_name is None:
+            out_name = name1 + '_' + name2 + '_ratio'
         if out_file is not None:
             hdu = fits.PrimaryHDU(
                 data=image,
@@ -443,16 +595,15 @@ class ImageScience:
                 out_file,
                 overwrite=True
             )
+            self.files[out_name] = out_file
 
-        if out_name is None:
-            out_name = name1 + '_' + name2 + '_ratio'
+
         self.images[out_name] = image
         self.headers[out_name] = self.headers[name1]
-        self.files[out_name] = out_file
         self.wcs[out_name] = self.wcs[name1]
 
     def get_pix_scale(self, wcs_name):
-        return self.wcs[wcs_name].wcs.cdelt[0]*3600*u.arcsec
+        return (proj_plane_pixel_scales(self.wcs[wcs_name])[0]*u.deg).to(u.arcsec)
 
     def get_pix_area(self, name):
         """
@@ -485,7 +636,8 @@ class ImageScience:
         cunit1 = header.get('CUNIT1')
         cunit2 = header.get('CUNIT2')
         if cunit1 is None:
-            print('No pixel units found in header under CUNIT1')
+            return ((proj_plane_pixel_area(self.wcs[name]))*u.deg**2).to(u.sr)
+
         try:
             unit1 = u.Unit(cunit1)
             unit2 = u.Unit(cunit2)
@@ -525,33 +677,95 @@ class ImageScience:
             "or CD1_1/CD2_2."
         )
 
+    def make_kernel(self,
+        image_name,
+        fwhm=None,
+        kernel_filepath=None,
+        crop_size=None,
+        normalize=True
+    ):
+        """
+        Build or prepare a 2D kernel to convolve with `image_name`.
+
+        Two modes:
+        - kernel_filepath given: reproject an existing kernel FITS file
+        onto this image's pixel grid/WCS.
+        - fwhm given (arcsec): build a Gaussian2DKernel matched to this
+        image's pixel scale.
+
+        Parameters
+        ----------
+        image_name : str
+            Key into self.images / self.headers used to get pixel scale/header.
+        fwhm : float or None
+            Target Gaussian FWHM in arcsec (used if kernel_filepath is None).
+        kernel_filepath : str or None
+            Path to a kernel FITS file to reproject onto image_name's grid.
+        crop_size : int or None
+            Passed through to reproject_kernel_to_image, if used.
+        normalize : bool
+            If True, normalize kernel to sum to 1.
+
+        Returns
+        -------
+        kernel : 2D ndarray
+        """
+        if kernel_filepath is not None:
+            kernel = reproject_kernel_to_image(
+                kernel_filepath,
+                self.headers[image_name],
+                crop_size=crop_size,
+                normalize=normalize
+            )
+
+        elif fwhm is not None:
+            pixscale = self.get_pix_scale(image_name).to_value(u.arcsec)
+            fwhm_pix = fwhm / pixscale
+            sigma_pix = fwhm_pix / (2 * np.sqrt(2 * np.log(2)))
+            kernel = Gaussian2DKernel(sigma_pix).array
+
+        else:
+            raise ValueError(
+                "make_kernel requires either kernel_filepath or fwhm to build a kernel."
+            )
+
+        #TJ fft convolve hates nans, replace them with zeros
+        kernel = np.nan_to_num(kernel)
+
+        if normalize:
+            kernel /= np.sum(kernel)
+
+        return kernel
+
     def fft_convolve(self,
         image_name,
-        kernel_filepath,
+        kernel,
         out_name=None,
         normalize_kernel=True,
         preserve_nan=True,
         boundary='fill',
         fill_value=0.0,
-        return_time=False
+        return_time=False,
+        out_file=None
     ):
         """
         Convolve image using FFT convolution.
 
         Parameters
         ----------
-        image : 2D ndarray
+        image_name : str
+            Key into self.images for the image to convolve.
         kernel : 2D ndarray
+            Kernel to convolve with (e.g. from make_kernel()).
 
         Returns
         -------
         convolved : ndarray
         elapsed_time : float (seconds)
         """
-        
+
         #TJ start timer to keep track of how long this method takes to convolve
         t0 = time.perf_counter()
-        kernel = reproject_kernel_to_image(kernel_filepath, self.headers[image_name], crop_size=None, normalize=True)
 
         image = self.images[image_name]
 
@@ -559,13 +773,12 @@ class ImageScience:
         kernel = np.nan_to_num(kernel)
 
         if normalize_kernel:
-
-            kernel /= np.sum(kernel)
+            kernel = kernel / np.sum(kernel)
 
         #TJ keep track of where the nans were
         if preserve_nan:
-
             nan_mask = ~np.isfinite(image)
+
         #TJ then remove the nans and convolve
         image_filled = np.nan_to_num(image)
 
@@ -580,7 +793,6 @@ class ImageScience:
         )
 
         if preserve_nan:
-
             convolved[nan_mask] = np.nan
 
         #TJ end timer when convolution ends
@@ -588,101 +800,29 @@ class ImageScience:
 
         #TJ copy header info from base file and save data as convolved version
         if out_name is None:
-            self.images[f'{image_name}_fft_conv'] = convolved
-            self.headers[f'{image_name}_fft_conv'] = self.headers[image_name].copy()
-            self.wcs[f'{image_name}_fft_conv'] = self.wcs[image_name].copy()
-        else:
-            self.images[out_name] = convolved
-            self.headers[out_name] = self.headers[image_name].copy()
-            self.wcs[out_name] = self.wcs[image_name].copy()
-        
-        out_file = (
-                        self.files[image_name]
-                        .replace('.fits', '_convolved.fits')
-                    )
-        hdu = fits.PrimaryHDU(
-            data=self.images[out_name],
-            header=self.headers[out_name]
-        )
+            out_name = f'{image_name}_fft_conv'
 
-        hdu.writeto(
-            out_file,
-            overwrite=True
-        )
-        print(f'File written to {out_file}')
-            
+        self.images[out_name] = convolved
+        self.headers[out_name] = self.headers[image_name].copy()
+        self.wcs[out_name] = self.wcs[image_name].copy()
+        if out_file is not None:
+            out_file = (
+                self.files[image_name]
+                .replace('.fits', '_convolved.fits')
+            )
+            hdu = fits.PrimaryHDU(
+                data=self.images[out_name],
+                header=self.headers[out_name]
+            )
+
+            hdu.writeto(
+                out_file,
+                overwrite=True
+            )
+            print(f'File written to {out_file}')
+
         if return_time:
             print(f'fft convolution took {elapsed} seconds')
-            return elapsed
-    
-    def convolve(self,
-        image_name,
-        kernel_filepath,
-        normalize_kernel=True,
-        preserve_nan=True,
-        boundary='fill',
-        fill_value=0.0,
-        return_time=False
-    ):
-
-        """
-        Convolve image using direct linear convolution.
-        THIS MAY TAKE A LOOONNG TIME...
-
-        Parameters
-        ----------
-        image : 2D ndarray
-        kernel : 2D ndarray
-
-        Returns
-        -------
-        convolved : ndarray
-        elapsed_time : float (seconds)
-        """
-        
-        t0 = time.perf_counter()
-        kernel = reproject_kernel_to_image(kernel_filepath, self.headers[image_name], crop_size=None, normalize=True)
-    
-        image = self.images[image_name]
-
-        kernel = np.nan_to_num(kernel)
-
-        if normalize_kernel:
-
-            kernel /= np.sum(kernel)
-
-        if preserve_nan:
-
-            nan_mask = ~np.isfinite(image)
-
-        image_filled = np.nan_to_num(image)
-
-        convolved = convolve(
-            image_filled,
-            kernel,
-            boundary=boundary,
-            fill_value=fill_value,
-            normalize_kernel=False,
-            preserve_nan=False
-        )
-
-        if preserve_nan:
-
-            convolved[nan_mask] = np.nan
-
-        elapsed = time.perf_counter() - t0
-
-        print('----------------------------------')
-        print('Direct Convolution Complete')
-        print('----------------------------------')
-        print(f'Time elapsed : {elapsed:.3f} sec')
-        print('----------------------------------')
-        
-        self.images['cont_conv'] = convolved
-        self.headers['cont_conv'] = self.headers[image_name].copy()
-        self.wcs['cont_conv'] = self.wcs[image_name].copy()
-        if return_time:
-            print(f'convolution took {elapsed} seconds')
             return elapsed
 
     def continuum_subtract(
@@ -1125,7 +1265,7 @@ class ImageScience:
             original_units = (
                 u.erg / (u.s * u.cm**2)
             )
-            pixel_area = get_pix_area(image_name)
+            pixel_area = self.get_pix_area(image_name)
 
             image_quantity = (
                 (image * original_units) /
@@ -1167,8 +1307,8 @@ class ImageScience:
             'background_flux': np.nan*u.W / (u.m**2 * u.Hz),
             'net_flux': np.nan*u.W / (u.m**2 * u.Hz),
             'background_surface_brightness': np.nan*u.W / (u.m**2 * u.Hz),
-            'source_area_pixels': np.nan*u.W / (u.m**2 * u.Hz),
-            'annulus_area_pixels': np.nan*u.W / (u.m**2 * u.Hz)}
+            'source_area_pixels': np.nan,
+            'annulus_area_pixels': np.nan}
 
         source_flux = aperture_photometry(
             image_quantity,
@@ -1203,7 +1343,7 @@ class ImageScience:
 
             valid = (
                 np.isfinite(annulus_data) &
-                (annulus_weights > 0)
+                (annulus_weights > 0.01)
             )
 
             annulus_values = annulus_data[valid]
@@ -1228,8 +1368,8 @@ class ImageScience:
             annulus_area_pixels = np.sum(annulus_weights)
 
         else:
-            background_flux = 0
-            background_surface_brightness = 0
+            background_flux = 0*source_flux.unit
+            background_surface_brightness = 0 * image_quantity.unit
             annulus_area_pixels = 0
 
         net_flux = (source_flux - background_flux)
@@ -1242,6 +1382,254 @@ class ImageScience:
             'source_area_pixels': source_area_pixels,
             'annulus_area_pixels': annulus_area_pixels
         }
+
+
+    def select_aperture(
+        self,
+        image_name,
+        loc=None,
+        radius=1.0 * u.arcsec,
+        zoom=8,
+        buff=0.1 * u.arcsec,
+        ann=0.1 * u.arcsec,
+        cmap='viridis'
+    ):
+        """
+        Interactively select an aperture for aperture photometry.
+
+        Left-click and drag inside aperture:
+            Move the aperture.
+
+        Left-click and drag near aperture edge:
+            Resize the aperture.
+
+        Click 'Confirm Aperture' button:
+            Accept the aperture. Then call get_result() in the next cell
+            to retrieve the final center and radius.
+
+        Parameters
+        ----------
+        image_name : str
+            Name of the image in self.images.
+        loc : SkyCoord, tuple, list, or None
+            Initial aperture center. If None, the center of the image is used.
+            If a tuple/list is supplied, it is interpreted as (RA, Dec) in degrees.
+        radius : Quantity
+            Initial aperture radius. Default is 1 arcsec.
+        zoom : float
+            Width of displayed cutout in units of aperture radii. Default is 8.
+        buff : Quantity
+            Width between the source aperture and background annulus.
+        ann : Quantity
+            Width of the background annulus.
+        cmap : str
+            Matplotlib colormap.
+
+        Returns
+        -------
+        get_result : callable
+            Call get_result() in a subsequent cell after confirming the aperture.
+            Returns (loc, radius) as (SkyCoord, Quantity).
+        """
+
+        import ipywidgets as widgets
+        from IPython.display import display as ipy_display
+
+        # ================================================================
+        # Get image information
+        # ================================================================
+
+        image = self.images[image_name]
+        wcs   = self.wcs[image_name]
+
+        # ================================================================
+        # Convert center to SkyCoord
+        # ================================================================
+
+        if loc is None:
+            x0  = (image.shape[1] - 1) / 2
+            y0  = (image.shape[0] - 1) / 2
+            loc = wcs.pixel_to_world(x0, y0)
+        elif not isinstance(loc, SkyCoord):
+            loc = SkyCoord(ra=loc[0]*u.deg, dec=loc[1]*u.deg, frame='icrs')
+
+        # ================================================================
+        # Pixel scale
+        # ================================================================
+
+        pixscale = self.get_pix_scale(image_name).to(u.arcsec)
+
+        # ================================================================
+        # Make initial cutout
+        # ================================================================
+
+        display_size = zoom * (radius + buff + ann)
+
+        cutout = Cutout2D(
+            image,
+            position=loc,
+            size=display_size,
+            wcs=wcs,
+            mode='trim'
+        )
+
+        cut_data = cutout.data
+        cut_wcs  = cutout.wcs
+
+        cx, cy = cut_wcs.world_to_pixel(loc)
+
+        # ================================================================
+        # Initial radii in pixels
+        # ================================================================
+
+        radius_pix = radius.to(u.arcsec).value / pixscale.value
+        buff_pix   = buff.to(u.arcsec).value   / pixscale.value
+        ann_pix    = ann.to(u.arcsec).value    / pixscale.value
+
+        # ================================================================
+        # Plot
+        # ================================================================
+
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': cut_wcs})
+
+        good = np.isfinite(cut_data)
+        vmin = np.nanpercentile(cut_data[good], 5)
+        vmax = np.nanpercentile(cut_data[good], 99.5)
+
+        ax.imshow(
+            cut_data,
+            origin='lower',
+            cmap=cmap,
+            norm=ImageNormalize(cut_data, stretch=AsinhStretch(), vmin=vmin, vmax=vmax)
+        )
+
+        ax.coords.grid(color='white', linestyle='--', linewidth=0.8, alpha=0.5)
+
+        # ================================================================
+        # Aperture circles
+        # ================================================================
+
+        aperture_circle = Circle((cx, cy), radius_pix,
+                                edgecolor='red', facecolor='none', linewidth=2)
+        buffer_circle   = Circle((cx, cy), radius_pix + buff_pix,
+                                edgecolor='cyan', facecolor='none', linewidth=1.5, linestyle='--')
+        annulus_circle  = Circle((cx, cy), radius_pix + buff_pix + ann_pix,
+                                edgecolor='cyan', facecolor='none', linewidth=1.5, linestyle='--')
+
+        ax.add_patch(aperture_circle)
+        ax.add_patch(buffer_circle)
+        ax.add_patch(annulus_circle)
+
+        ax.set_title(
+            f'{image_name}\nDrag center to move  |  Drag edge to resize  |  Click Confirm when done',
+            fontsize=11
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        # ================================================================
+        # State
+        # ================================================================
+
+        state = {
+            'loc':          loc,
+            'radius_pix':   radius_pix,
+            'mode':         None,
+            'final_loc':    None,
+            'final_radius': None,
+        }
+
+        # ================================================================
+        # Mouse callbacks
+        # ================================================================
+
+        def on_press(event):
+            if event.inaxes != ax or event.xdata is None:
+                return
+            dx = event.xdata - aperture_circle.center[0]
+            dy = event.ydata - aperture_circle.center[1]
+            dist = np.sqrt(dx**2 + dy**2)
+            edge_tol = max(5, 0.25 * aperture_circle.radius)
+            if abs(dist - aperture_circle.radius) < edge_tol:
+                state['mode'] = 'resize'
+            elif dist <= aperture_circle.radius:
+                state['mode'] = 'move'
+            else:
+                state['mode'] = None
+
+        def on_release(event):
+            state['mode'] = None
+
+        def on_motion(event):
+            if state['mode'] is None or event.inaxes != ax or event.xdata is None:
+                return
+
+            if state['mode'] == 'move':
+                new_x, new_y = event.xdata, event.ydata
+                for circle in [aperture_circle, buffer_circle, annulus_circle]:
+                    circle.center = (new_x, new_y)
+                # Convert cutout pixel -> full image pixel -> sky
+                x_full = new_x + cutout.xmin_original
+                y_full = new_y + cutout.ymin_original
+                state['loc'] = wcs.pixel_to_world(x_full, y_full)
+
+            elif state['mode'] == 'resize':
+                dx = event.xdata - aperture_circle.center[0]
+                dy = event.ydata - aperture_circle.center[1]
+                new_r = max(np.sqrt(dx**2 + dy**2), 1.0)
+                state['radius_pix'] = new_r
+                aperture_circle.set_radius(new_r)
+                buffer_circle.set_radius(new_r + buff_pix)
+                annulus_circle.set_radius(new_r + buff_pix + ann_pix)
+
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('button_press_event',   on_press)
+        fig.canvas.mpl_connect('button_release_event', on_release)
+        fig.canvas.mpl_connect('motion_notify_event',  on_motion)
+
+        # ================================================================
+        # Confirm button
+        # ================================================================
+
+        confirm_button = widgets.Button(
+            description='Confirm Aperture',
+            button_style='success',
+            icon='check',
+            layout=widgets.Layout(width='200px', height='40px')
+        )
+        output = widgets.Output()
+
+        def on_confirm(b):
+            state['final_radius'] = state['radius_pix'] * pixscale
+            state['final_loc']    = state['loc']
+            confirm_button.disabled    = True
+            confirm_button.description = '✓ Confirmed'
+            with output:
+                print('Aperture confirmed:')
+                print(f'  RA     = {state["final_loc"].ra.deg:.8f} deg')
+                print(f'  Dec    = {state["final_loc"].dec.deg:.8f} deg')
+                print(f'  Radius = {state["final_radius"]:.4f}')
+                print('Now call loc, radius in the next cell using the output.')
+
+        confirm_button.on_click(on_confirm)
+
+        plt.tight_layout()
+        ipy_display(widgets.VBox([confirm_button, output]))
+        plt.show(block=False)
+
+        # ================================================================
+        # get_result callable returned to the user
+        # ================================================================
+
+        def get_result():
+            if state['final_loc'] is None:
+                print('Aperture not yet confirmed — click "Confirm Aperture" first.')
+                return None, None
+            return state['final_loc'], state['final_radius']
+
+        return get_result
+
 
     def get_equivalent_width(self,
         feature_image_name,
@@ -1261,9 +1649,9 @@ class ImageScience:
 
         Parameters
         ----------
-        feature_filter_file : str
+        feature_image_file : str (this is the full feature image, not the continuum subtracted one)
 
-        continuum_filter_file : str
+        continuum_filter_file : str (This is just the continuum image, subtracting this from the feature_image should give just the line)
 
         location : SkyCoord or [ra, dec] or (x, y)
 
@@ -1454,18 +1842,111 @@ class ImageScience:
 
         return ratio
 
-    def display(self, names, loc, radius, background_annulus_thickness=0*u.arcsec, buffer=0*u.arcsec, ncols=3, cmap='viridis', zoom=5, show_grid=False):
+    def find_sources(self,
+        image_name,
+        threshold,
+        fwhm,
+        sigma_clip=3.0,
+        sharplo=0.2,
+        sharphi=1.0,
+        roundlo=-1.0,
+        roundhi=1.0,
+        exclude_border=True,
+        return_coords=True,
+        min_sep=1
+    ):
         """
-        Create a collage of cutout images with an aperture overlay.
-        
+        Detect compact (point-like) sources in an image using DAOStarFinder.
+
         Parameters
         ----------
-        list_of_image_fits_files : list of str
-            List of FITS image file paths (must contain SCI extension).
-        loc : list, tuple, or SkyCoord
+        image_name : str
+            Key into self.images / self.wcs for the image to search.
+        threshold : float
+            Detection threshold in units of the (sigma-clipped) background
+            standard deviation. E.g. threshold=5 means sources must have a
+            peak pixel value > 5-sigma above the background.
+        fwhm : Quantity
+            Expected FWHM of the PSF, in angular units (e.g. arcsec). This is
+            converted to pixels internally using this image's pixel scale.
+        sigma_clip : float, optional
+            Sigma for sigma-clipped background stats used to estimate the
+            background level and noise (default = 3.0).
+        sharplo, sharphi : float, optional
+            Lower/upper bound on source "sharpness" passed to DAOStarFinder,
+            used to reject extended sources or hot pixels (defaults = 0.2, 1.0).
+        roundlo, roundhi : float, optional
+            Lower/upper bound on source "roundness" passed to DAOStarFinder,
+            used to reject elongated sources (defaults = -1.0, 1.0).
+        exclude_border : bool, optional
+            If True, drop sources whose footprint falls off the edge of the
+            image (default = True).
+        return_coords : bool, optional
+            If True, add a 'sky_coord' column with SkyCoord objects for each
+            source, computed from this image's WCS (default = True).
+        min_sep : float, optional
+            Minimum number of fwhm between sources. Defaults to 1
+
+        Returns
+        -------
+        sources : astropy.table.Table or None
+            Table of detected sources (positions, fluxes, sharpness,
+            roundness, etc.), or None if no sources were found.
+        """
+
+        image = self.images[image_name]
+        wcs = self.wcs[image_name]
+
+        #TJ convert PSF FWHM from arcsec to pixels using this image's pixel scale
+        pixscale = self.get_pix_scale(image_name).to_value(u.arcsec)
+        fwhm_pix = fwhm.to_value(u.arcsec) / pixscale
+
+        #TJ estimate background level/noise via sigma-clipped stats
+        #TJ fill nans first since sigma_clipped_stats and DAOStarFinder don't like them
+        image_filled = np.nan_to_num(image)
+        mean, median, std = sigma_clipped_stats(image_filled, sigma=sigma_clip)
+
+        daofind = DAOStarFinder(
+            fwhm=fwhm_pix,
+            threshold=threshold * std,
+            sharplo=sharplo,
+            sharphi=sharphi,
+            roundlo=roundlo,
+            roundhi=roundhi,
+            exclude_border=exclude_border,
+            min_separation=fwhm_pix * min_sep
+        )
+
+        sources = daofind(image_filled - median)
+
+        if sources is None:
+            print(f"No sources found in '{image_name}' at threshold={threshold}.")
+            return None
+
+        print(f"Found {len(sources)} sources in '{image_name}'.")
+
+        if return_coords:
+            sky_coords = wcs.pixel_to_world(sources['xcentroid'], sources['ycentroid'])
+            sources['sky_coord'] = sky_coords
+
+        return sources
+
+    def display(self, names, loc=None, radius=None, bg_ann=0*u.arcsec, buffer=0*u.arcsec, ncols=3, cmap='viridis', zoom=5, show_grid=False, vmin=None, vmax=None):
+        """
+        Create a collage of cutout images with an aperture overlay.
+
+        Parameters
+        ----------
+        names : list of str
+            List of image keys (must be present in self.images / self.wcs).
+        loc : list, tuple, SkyCoord, or None
             Location of aperture center, either [RA, Dec] in degrees or a SkyCoord object.
-        radius : Quantity
+            If None (along with radius=None), the full image is displayed instead of a cutout,
+            using ZScale limits and log stretch, with no aperture overlay.
+        radius : Quantity or None
             Aperture radius (must have angular units, e.g. arcsec).
+            If None (along with loc=None), the full image is displayed instead of a cutout,
+            using ZScale limits and log stretch, with no aperture overlay.
         ncols : int, optional
             Number of columns in the collage (default = 3).
         cmap : str, optional
@@ -1473,12 +1954,15 @@ class ImageScience:
         zoom : float, optional
             How many radii does image include (default = 5)
         """
-        
-        # Make sure loc is SkyCoord
-        if not isinstance(loc, SkyCoord):
-            loc_sky = SkyCoord(ra=loc[0]*u.deg, dec=loc[1]*u.deg, frame='icrs')
-        else:
-            loc_sky = loc
+
+        full_image_mode = (loc is None) or (radius is None)
+
+        # Make sure loc is SkyCoord (only needed in cutout mode)
+        if not full_image_mode:
+            if not isinstance(loc, SkyCoord):
+                loc_sky = SkyCoord(ra=loc[0]*u.deg, dec=loc[1]*u.deg, frame='icrs')
+            else:
+                loc_sky = loc
 
         n_images = len(names)
         nrows = int(np.ceil(n_images / ncols))
@@ -1488,66 +1972,83 @@ class ImageScience:
         for i, name in enumerate(names):
             image = self.images[name]
             wcs = self.wcs[name]
+            pixel_scale = self.get_pix_scale(name).value
 
-            try:
-                pixel_scale = np.abs(wcs.wcs.cd[0][0]) * 3600
-            except:
-                pixel_scale = np.abs(wcs.wcs.cdelt[0]) * 3600
-             
-            cutout = Cutout2D(image, position=loc_sky, size=((radius+buffer+background_annulus_thickness)*zoom, (radius+buffer+background_annulus_thickness)*zoom), wcs=wcs)
+            if full_image_mode:
+                display_data = image
+                display_wcs = wcs
+            else:
+                cutout = Cutout2D(image, position=loc_sky, size=((radius+buffer+bg_ann)*zoom, (radius+buffer+bg_ann)*zoom), wcs=wcs)
+                display_data = cutout.data
+                display_wcs = cutout.wcs
 
             # Each subplot gets its own WCS projection
-            ax = fig.add_subplot(nrows, ncols, i+1, projection=cutout.wcs)
+            ax = fig.add_subplot(nrows, ncols, i+1, projection=display_wcs)
+            interval = ZScaleInterval()
 
-            x_img, y_img = cutout.wcs.world_to_pixel(loc_sky)
-
-            im = ax.imshow(cutout.data, origin='lower', cmap=cmap,
-                    norm=ImageNormalize(cutout.data, stretch=AsinhStretch(),
-                                        vmin=0, vmax=np.percentile(cutout.data, 99)))
+            if full_image_mode:
+                if (vmin is None) and (vmax is None):
+                    ax_vmin, ax_vmax = interval.get_limits(display_data)
+                else:
+                    ax_vmin, ax_vmax = vmin, vmax
+                im = ax.imshow(display_data, origin='lower', cmap=cmap,
+                        norm=ImageNormalize(display_data, stretch=LogStretch(),
+                                            vmin=ax_vmin, vmax=ax_vmax))
+            else:
+                x_img, y_img = display_wcs.world_to_pixel(loc_sky)
+                if (vmin is None) and (vmax is None):
+                    ax_vmin, ax_vmax = interval.get_limits(display_data)
+                else:
+                    ax_vmin, ax_vmax = vmin, vmax
+                im = ax.imshow(display_data, origin='lower', cmap=cmap,
+                        norm=ImageNormalize(display_data, stretch=AsinhStretch(),
+                                            vmin=ax_vmin, vmax=ax_vmax))
 
             if show_grid:
                 ax.coords.grid(color='white', linestyle='--', linewidth=1, alpha=0.7)
 
-            ax.add_patch(Circle((x_img, y_img),
-                                (radius.to(u.arcsec).value) / pixel_scale,
-                                ec='red', fc='none', lw=2, alpha=0.7))
-            # Background annulus
-            if background_annulus_thickness > 0*u.arcsec:
+            if not full_image_mode:
+                ax.add_patch(Circle((x_img, y_img),
+                                    (radius.to(u.arcsec).value) / pixel_scale,
+                                    ec='red', fc='none', lw=2, alpha=0.7))
+                # Background annulus
+                if bg_ann > 0*u.arcsec:
 
-                inner_r = (
-                    radius.to(u.arcsec).value +
-                    buffer.to(u.arcsec).value
-                ) / pixel_scale
+                    inner_r = (
+                        radius.to(u.arcsec).value +
+                        buffer.to(u.arcsec).value
+                    ) / pixel_scale
 
-                outer_r = (
-                    radius.to(u.arcsec).value +
-                    buffer.to(u.arcsec).value +
-                    background_annulus_thickness.to(u.arcsec).value
-                ) / pixel_scale
+                    outer_r = (
+                        radius.to(u.arcsec).value +
+                        buffer.to(u.arcsec).value +
+                        bg_ann.to(u.arcsec).value
+                    ) / pixel_scale
 
-                ax.add_patch(
-                    Circle(
-                        (x_img, y_img),
-                        inner_r,
-                        ec='cyan',
-                        fc='none',
-                        lw=2,
-                        ls='--',
-                        alpha=0.8
+                    ax.add_patch(
+                        Circle(
+                            (x_img, y_img),
+                            inner_r,
+                            ec='cyan',
+                            fc='none',
+                            lw=2,
+                            ls='--',
+                            alpha=0.8
+                        )
                     )
-                )
 
-                ax.add_patch(
-                    Circle(
-                        (x_img, y_img),
-                        outer_r,
-                        ec='cyan',
-                        fc='none',
-                        lw=2,
-                        ls='--',
-                        alpha=0.8
+                    ax.add_patch(
+                        Circle(
+                            (x_img, y_img),
+                            outer_r,
+                            ec='cyan',
+                            fc='none',
+                            lw=2,
+                            ls='--',
+                            alpha=0.8
+                        )
                     )
-                )
+
             cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("Flux (native units)", fontsize=10)
             ax.set_title(name, fontsize=12)
